@@ -9,6 +9,7 @@
 --
 -- Incluye:
 --   - modo de servicio: normal, degradado y escrituras suspendidas;
+--   - degradación automática declarada por la medición del propio relay;
 --   - despliegue en servicio, retirada y reversión;
 --   - compatibilidad de versión de protocolo entre relay y conector;
 --   - objetivos de servicio del piloto, declarados como configuración;
@@ -27,8 +28,11 @@
 --   - un presupuesto de piloto todavía sin cerrar, del que dependen los
 --     objetivos declarados abajo.
 --
--- Nota: los objetivos de config son objetivos a validar, no promesas
--- públicas. Ninguna regla de este sistema promete cumplirlos.
+-- Nota: los objetivos de config son meta interna del piloto —99,5 % mensual de
+-- disponibilidad y overhead p95 bajo 500 ms—, no un compromiso contractual con
+-- nadie. Se declaran para poder medirlos y discutirlos, no para prometerlos:
+-- ninguna regla de este sistema promete cumplirlos y ningún incumplimiento
+-- genera derecho alguno.
 
 use "./installation-link.allium" as enlace
 
@@ -46,6 +50,7 @@ external entity OperadorDeMediaFranca {
 
 enum MotivoDeDegradacion {
     latencia_excesiva
+    | tasa_de_error_excesiva
     | dependencia_caida
     | despliegue_defectuoso
     | incidente_de_confidencialidad
@@ -60,8 +65,23 @@ entity ModoDeServicio {
     estado: normal | degradado | escrituras_suspendidas
     desde: Timestamp?
     motivo: MotivoDeDegradacion?
+    declarado_por_medicion: Boolean
 
     escrituras_admitidas: estado in {normal, degradado}
+}
+
+entity SenalDeServicio {
+    -- Lo que el relay mide de sí mismo sobre una ventana reciente. Existe
+    -- porque un servicio degradado sin operador presente se veía como servicio
+    -- normal: la degradación la declara la medición, no la disponibilidad de
+    -- alguien que la mire.
+    medida_en: Timestamp
+    ventana: Duration
+    overhead_p95_en_milisegundos: Integer
+    tasa_de_error: Decimal
+    solicitudes_observadas: Integer
+
+    muestra_suficiente: solicitudes_observadas >= config.muestras_minimas_para_degradar
 }
 
 entity Despliegue {
@@ -90,29 +110,93 @@ config {
     version_de_protocolo_minima: Integer = enlace/config.version_minima_admitida
     version_de_protocolo_maxima: Integer = enlace/config.version_maxima_admitida
 
-    -- Cuántas versiones de esquema deben seguir siendo aceptadas.
-    versiones_compatibles_hacia_atras: Integer = 1
+    -- Cuántas versiones de esquema deben seguir siendo aceptadas: la actual y
+    -- las dos anteriores. Un conector que quedó dos publicaciones atrás sigue
+    -- operando.
+    versiones_compatibles_hacia_atras: Integer = 3
 
-    -- Objetivos del piloto. A validar con mediciones, no a prometer.
+    -- Objetivos del piloto: meta interna, a validar con mediciones. No son
+    -- compromiso contractual con nadie.
     disponibilidad_mensual_objetivo: Decimal = 99.5
     deteccion_de_caida_objetivo: Duration = enlace/config.umbral_de_latido
     overhead_p95_objetivo_en_milisegundos: Integer = 500
     revocacion_efectiva_objetivo: Duration = 10.seconds
+
+    -- Umbrales de la degradación automática. Provisionales: qué métrica manda
+    -- y con qué umbral es lo único que quedó abierto de esta decisión.
+    ventana_de_medicion: Duration = 5.minutes
+    umbral_de_overhead_p95_para_degradar: Integer = overhead_p95_objetivo_en_milisegundos * 2
+    umbral_de_tasa_de_error_para_degradar: Decimal = 5.0
+    muestras_minimas_para_degradar: Integer = 50
 }
 
 ------------------------------------------------------------
 -- Defaults
 ------------------------------------------------------------
 
-default ModoDeServicio servicio = { estado: normal }
+default ModoDeServicio servicio = { estado: normal, declarado_por_medicion: false }
 
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
+-- Medir ------------------------------------------------------------------
+
+rule RegistrarSenalDeServicio {
+    when: RelayMideVentanaDeServicio(overhead_p95_en_milisegundos, tasa_de_error, solicitudes_observadas)
+    ensures: SenalDeServicio.created(
+        medida_en: now,
+        ventana: config.ventana_de_medicion,
+        overhead_p95_en_milisegundos: overhead_p95_en_milisegundos,
+        tasa_de_error: tasa_de_error,
+        solicitudes_observadas: solicitudes_observadas
+    )
+
+    @guidance
+        -- La medición es agregada y no deriva del contenido: latencia, error y
+        -- volumen sobre la ventana. Entra por la telemetría del propio relay,
+        -- no por la mano de un operador.
+}
+
 -- Degradar y restablecer --------------------------------------------------
 
+rule DegradarPorLatenciaMedida {
+    -- La degradación por latencia no espera a que alguien la note: la declara
+    -- la medición.
+    when: senal: SenalDeServicio.created
+    requires: servicio.estado = normal
+    requires: senal.muestra_suficiente
+    requires: senal.overhead_p95_en_milisegundos > config.umbral_de_overhead_p95_para_degradar
+    ensures:
+        servicio.estado = degradado
+        servicio.desde = now
+        servicio.motivo = latencia_excesiva
+        servicio.declarado_por_medicion = true
+        ModoDeServicioCambiado(estado: degradado, motivo: latencia_excesiva)
+}
+
+rule DegradarPorTasaDeErrorMedida {
+    when: senal: SenalDeServicio.created
+    requires: servicio.estado = normal
+    requires: senal.muestra_suficiente
+    requires: senal.overhead_p95_en_milisegundos <= config.umbral_de_overhead_p95_para_degradar
+    requires: senal.tasa_de_error > config.umbral_de_tasa_de_error_para_degradar
+    ensures:
+        servicio.estado = degradado
+        servicio.desde = now
+        servicio.motivo = tasa_de_error_excesiva
+        servicio.declarado_por_medicion = true
+        ModoDeServicioCambiado(estado: degradado, motivo: tasa_de_error_excesiva)
+
+    @guidance
+        -- Una tasa de error alta se declara, no se disimula. Lo que nunca se
+        -- hace para bajarla es relajar la autenticación: un aumento de 401 o
+        -- 403 es un resultado correcto del sistema, no una avería.
+}
+
 rule DeclararDegradacion {
+    -- La declaración manual sigue existiendo para lo que ninguna métrica ve:
+    -- una dependencia caída, un despliegue que se sabe defectuoso.
     when: OperadorDeclaraDegradacion(operador, motivo)
     requires: servicio.estado = normal
     requires: motivo != incidente_de_confidencialidad
@@ -120,6 +204,7 @@ rule DeclararDegradacion {
         servicio.estado = degradado
         servicio.desde = now
         servicio.motivo = motivo
+        servicio.declarado_por_medicion = false
         ModoDeServicioCambiado(estado: degradado, motivo: motivo)
 
     @guidance
@@ -130,13 +215,19 @@ rule DeclararDegradacion {
 
 rule SuspenderEscriturasPorIncidente {
     -- Ante un incidente que pueda afectar confidencialidad se sacrifica
-    -- disponibilidad de escritura antes que confidencialidad.
+    -- disponibilidad de escritura antes que confidencialidad. Sólo un operador
+    -- humano declara un incidente de confidencialidad, con evidencia a la
+    -- vista: alertas, metadatos de auditoría, un reporte. No existe ni debe
+    -- existir un disparador automático, porque suspender escrituras es
+    -- destructivo para el producto y una métrica no distingue un ataque de un
+    -- lunes raro.
     when: OperadorDeclaraIncidenteDeConfidencialidad(operador, motivo)
     requires: servicio.estado in {normal, degradado}
     ensures:
         servicio.estado = escrituras_suspendidas
         servicio.desde = now
         servicio.motivo = motivo
+        servicio.declarado_por_medicion = false
         ModoDeServicioCambiado(estado: escrituras_suspendidas, motivo: motivo)
 
     @guidance
@@ -146,12 +237,16 @@ rule SuspenderEscriturasPorIncidente {
 }
 
 rule RestablecerServicio {
+    -- Restablecer es siempre del operador, incluso cuando la degradación la
+    -- declaró la medición: volver a normal es una afirmación sobre el mundo
+    -- que alguien firma.
     when: OperadorRestableceServicio(operador)
     requires: servicio.estado in {degradado, escrituras_suspendidas}
     ensures:
         servicio.estado = normal
         servicio.desde = now
         servicio.motivo = null
+        servicio.declarado_por_medicion = false
         ModoDeServicioCambiado(estado: normal, motivo: null)
 }
 
@@ -160,7 +255,9 @@ rule RestablecerServicio {
 rule PublicarDespliegue {
     when: OperadorPublicaDespliegue(operador, version_del_relay, version_minima, version_maxima)
     requires: version_maxima >= version_minima
-    requires: version_maxima - version_minima >= config.versiones_compatibles_hacia_atras - 1
+    requires:
+        version_maxima - version_minima >= config.versiones_compatibles_hacia_atras - 1
+        or version_minima <= config.version_de_protocolo_minima
     ensures:
         for anterior in Despliegues where estado = en_servicio:
             anterior.estado = retirado
@@ -176,9 +273,11 @@ rule PublicarDespliegue {
         DespliegueEnServicio(version_del_relay: version_del_relay)
 
     @guidance
-        -- Un cambio de esquema debe seguir aceptando al menos la versión
-        -- anterior del conector. Una Desktop antigua sigue operando o recibe
-        -- un rechazo explícito de versión; nunca un fallo silencioso.
+        -- Un cambio de esquema debe seguir aceptando la versión actual y las
+        -- dos anteriores del conector. La segunda condición cubre el piloto,
+        -- donde todavía no existen tres versiones: admitir desde la primera
+        -- que existió es admitir todas. Una Desktop antigua sigue operando o
+        -- recibe un rechazo explícito de versión; nunca un fallo silencioso.
 }
 
 rule RevertirDespliegue {
@@ -245,6 +344,7 @@ surface SaludDelServicio {
         servicio.estado
         servicio.desde
         servicio.motivo
+        servicio.declarado_por_medicion
         for despliegue in despliegues_activos:
             despliegue.version_del_relay
             despliegue.version_de_protocolo_minima
@@ -268,6 +368,37 @@ surface SaludDelServicio {
     @guarantee AutenticacionNoSeRelajaPorDisponibilidad
         -- Ninguna acción de esta superficie puede aflojar la autenticación
         -- para recuperar disponibilidad.
+
+    @guarantee IncidenteDeConfidencialidadSoloHumano
+        -- Suspender escrituras exige un operador humano que declare el
+        -- incidente con evidencia. Ninguna métrica, alerta ni regla automática
+        -- lo dispara: lo automático llega hasta declarar degradación.
+
+    @guarantee DegradacionVisibleAunqueNadieMire
+        -- El servicio se declara degradado por lo que mide, no por quién está
+        -- de turno. La superficie dice además si la degradación la declaró la
+        -- medición o una persona.
+}
+
+surface SenalDeSaludMedida {
+    -- Frontera con la telemetría del propio relay: la medición entra al modelo
+    -- por aquí, sin operador humano de por medio. Es lo que permite que un
+    -- servicio degradado a las tres de la mañana se declare degradado.
+    provides:
+        RelayMideVentanaDeServicio(
+            overhead_p95_en_milisegundos,
+            tasa_de_error,
+            solicitudes_observadas
+        )
+
+    @guarantee MedicionSinContenido
+        -- La medición son agregados de latencia, error y volumen sobre una
+        -- ventana. Ninguna señal deriva del contenido que atraviesa el relay
+        -- ni identifica a una instalación concreta.
+
+    @guarantee MedirNoDegradaPorSiSolo
+        -- Una ventana con pocas muestras no degrada el servicio. Un servicio
+        -- ocioso con tres solicitudes lentas no es un servicio degradado.
 }
 
 surface ReversionDeDespliegue {
@@ -336,18 +467,12 @@ surface CompatibilidadDeProtocolo {
         -- se deja al conector reintentando contra un rechazo opaco.
 
     @guarantee CompatibilidadHaciaAtras
-        -- Un cambio de esquema mantiene admitida al menos la versión anterior
-        -- del conector durante el periodo declarado en configuración.
+        -- Un cambio de esquema mantiene admitidas la versión actual y las dos
+        -- anteriores del conector, o todas las que existan si son menos.
 }
 
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
-open question "¿Qué SLO puede sostener realmente el presupuesto del piloto? El 99,5 % mensual y el overhead p95 de 500 ms son objetivos declarados sin medición ni costo asociado."
-
-open question "¿La degradación se declara manualmente o se deriva de una señal medida? Hoy sólo existe la declaración del operador, lo que significa que un servicio degradado sin operador presente se ve como servicio normal."
-
-open question "¿Durante cuántas versiones debe mantenerse la compatibilidad hacia atrás del esquema de sobre? El valor de config dice una versión; nadie lo ha confirmado contra el ritmo real de publicación del conector."
-
-open question "¿Quién puede declarar un incidente de confidencialidad y con qué evidencia? Suspender escrituras es una acción destructiva para el producto y hoy no tiene ceremonia definida."
+open question "¿Qué métrica manda para degradar automáticamente y con qué umbral? Está decidido que la degradación la declara la medición; los umbrales de config (overhead p95 al doble del objetivo, 5 % de error, 50 muestras mínimas) son una primera propuesta sin datos detrás. Queda igualmente abierto si el retorno a normal debe ser automático cuando la señal se recupera, o siempre del operador como está hoy."

@@ -10,7 +10,8 @@
 --   - clases de dato admitidas y prohibidas en el estado persistido;
 --   - clases de campo admitidas y prohibidas en los registros operativos;
 --   - asiento de auditoría sin payload, su agregación y su caducidad;
---   - eliminación de una instalación con periodo de recuperación;
+--   - eliminación de una instalación con periodo de recuperación, que arrastra
+--     sus asientos de auditoría sin esperar la retención normal;
 --   - constancia de borrado sin contenido borrado.
 --
 -- Excluye:
@@ -78,6 +79,10 @@ enum ClaseDeDato {
     | revocacion
     | identificador_aleatorio
     | codigo_de_error_clasificado
+    -- Etiqueta que la persona elige para reconocer una aplicación ("Claude en
+    -- mi laptop"). Es dato de control: lo escribe la persona para sí misma, no
+    -- deriva del contenido ni del tráfico. Ver client-grants.allium.
+    | etiqueta_de_aplicacion
     -- Prohibidas. Se nombran para que la prohibición sea comprobable y no
     -- sólo una promesa en prosa.
     | titulo_de_pagina
@@ -147,7 +152,8 @@ entity RegistroDeControl {
             contador,
             revocacion,
             identificador_aleatorio,
-            codigo_de_error_clasificado
+            codigo_de_error_clasificado,
+            etiqueta_de_aplicacion
         })
     }
 }
@@ -213,10 +219,16 @@ entity ConstanciaDeBorrado {
 ------------------------------------------------------------
 
 config {
-    -- Retenciones iniciales, pendientes de confirmación jurídica.
+    -- Retenciones operativas del piloto: 14 días de evento detallado y 90 de
+    -- métrica agregada. Son una propuesta técnica, fijada aquí para que el
+    -- sistema tenga un comportamiento definido, y siguen pendientes de
+    -- revisión jurídica bajo la Ley 21.719 chilena. Si esa revisión las
+    -- cambia, cambian aquí y en ningún otro sitio: ninguna regla las esconde.
     retencion_de_eventos_detallados: Duration = 14.days
     retencion_de_metricas_agregadas: Duration = 90.days
-    periodo_de_recuperacion_de_eliminacion: Duration = 7.days
+
+    -- Decidido por el dueño del producto.
+    periodo_de_recuperacion_de_eliminacion: Duration = 30.days
 }
 
 ------------------------------------------------------------
@@ -238,7 +250,8 @@ rule AbrirRegistroDeControl {
             contador,
             revocacion,
             identificador_aleatorio,
-            codigo_de_error_clasificado
+            codigo_de_error_clasificado,
+            etiqueta_de_aplicacion
         },
         creado_en: now
     )
@@ -386,16 +399,25 @@ rule CancelarEliminacionDeInstalacion {
 rule EjecutarEliminacionDeInstalacion {
     when: eliminacion: EliminacionDeInstalacion.ejecutable_en <= now
     requires: eliminacion.estado = en_recuperacion
+    let asientos = AsientosDeAuditoria where instalacion = eliminacion.instalacion
     ensures:
         eliminacion.estado = ejecutada
         eliminacion.resuelta_en = now
         for registro in RegistrosDeControl where instalacion = eliminacion.instalacion:
             not exists registro
+        for asiento in asientos:
+            not exists asiento
         ConstanciaDeBorrado.created(
             referencia_pseudonima: hash(eliminacion.instalacion.id_publico),
             clase: estado_de_instalacion,
             ejecutado_en: now,
             elementos: 1
+        )
+        ConstanciaDeBorrado.created(
+            referencia_pseudonima: hash(eliminacion.instalacion.id_publico),
+            clase: asiento_detallado,
+            ejecutado_en: now,
+            elementos: asientos.count
         )
         EstadoDeInstalacionBorrado(instalacion: eliminacion.instalacion)
 
@@ -403,6 +425,10 @@ rule EjecutarEliminacionDeInstalacion {
         -- Queda constancia del borrado y no queda lo borrado. La constancia
         -- usa una referencia pseudónima: sirve para responder "sí, se borró",
         -- no para reconstruir a quién pertenecía.
+        -- Los asientos de auditoría de la instalación se borran aquí, sin
+        -- esperar sus 14 días: eliminar es eliminar, no adelantar una
+        -- anonimización. Los asientos ya agregados no tienen instalación y por
+        -- eso no están en este conjunto: dejaron de ser un dato sobre nadie.
 }
 
 ------------------------------------------------------------
@@ -475,6 +501,30 @@ surface EventosOperativos {
         AsientoDetalladoSeAgrega
 }
 
+surface ConstanciasDeBorrado {
+    -- La única evidencia que deja un borrado, y es interna: sirve a
+    -- MediaFranca para responder "sí, se borró" ante una auditoría, no para
+    -- reconstruir de quién era lo borrado.
+    facing operador: Operador
+
+    context constancia: ConstanciaDeBorrado
+
+    exposes:
+        constancia.referencia_pseudonima
+        constancia.clase
+        constancia.ejecutado_en
+        constancia.elementos
+
+    @guarantee ConstanciaNoIdentifica
+        -- La referencia es pseudónima y no se puede volver desde ella al
+        -- identificador público ni a la persona. Una constancia dice que hubo
+        -- un borrado y de qué clase; nada más.
+
+    @guarantee ConstanciaNoSeMuestraALaPersona
+        -- Esta superficie es de operación. Lo que la persona observa de un
+        -- borrado es que su identificador deja de responder, y nada más.
+}
+
 surface ControlDeDatosDeLaInstalacion {
     -- Lo que la persona propietaria decide sobre el estado que el relay
     -- conserva de ella. En el piloto lo presenta Vera Desktop.
@@ -501,22 +551,31 @@ surface ControlDeDatosDeLaInstalacion {
         -- autorizado: se comporta igual que un identificador que nunca
         -- existió.
 
+    @guarantee LaEvidenciaDelBorradoEsElSilencio
+        -- A la persona no se le entrega ningún certificado ni recibo de
+        -- borrado. La evidencia observable es que su identificador público
+        -- deja de responder. La constancia pseudónima que queda es interna,
+        -- para auditoría de MediaFranca, y no se le expone: mostrársela
+        -- exigiría volver a identificarla, que es justo lo que el borrado
+        -- deshizo.
+
     @guarantee ElBorradoNoAlcanzaAVera
         -- Eliminar el estado del relay no borra ni una página del grafo
         -- local. Perder el relay obliga a reconectar clientes, nunca a
         -- perder memoria.
+
+    @guarantee SinExportacionDelEstadoDeControl
+        -- El piloto no produce ninguna exportación cifrada del estado de
+        -- control, ni siquiera para recuperarse a sí mismo: una copia así
+        -- sería exactamente la copia que el relay promete no tener. La
+        -- consecuencia se asume y se dice: ante pérdida total del relay, todas
+        -- las instalaciones vuelven a emparejar desde cero. Ni siquiera el
+        -- código de recuperación de installation-link.allium sirve entonces,
+        -- porque su hash vivía en el estado perdido.
 }
 
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
-open question "¿Qué metadatos operativos y qué retenciones acepta jurídicamente MediaFranca bajo la Ley 21.719? Los 14 y 90 días son una propuesta técnica sin revisión legal, y de ella depende el rol de tratamiento que MediaFranca asume."
-
-open question "¿Cuánto dura el periodo de recuperación antes de ejecutar la eliminación de una instalación? El valor de config es una suposición: no hay decisión."
-
-open question "¿Qué constituye evidencia suficiente de borrado para una persona que la solicita? Hoy existe una constancia pseudónima interna; no está definido si la persona debe poder verla ni cómo se la mostraría sin identificarla."
-
-open question "¿Debe existir una exportación cifrada del estado de control para recuperar el servicio, y qué la distingue de una copia que el relay no debería tener?"
-
-open question "¿Qué ocurre con los asientos de auditoría de una instalación eliminada antes de cumplir su retención? Hoy sobreviven anonimizados; podría exigirse su borrado inmediato."
+open question "Revisión jurídica pendiente: ¿acepta la Ley 21.719 chilena las retenciones de 14 y 90 días y las clases de metadato listadas arriba, y qué rol de tratamiento asume MediaFranca al conservarlas? Los valores operativos ya están fijados; lo que falta es el dictamen legal, no la decisión de producto."

@@ -10,6 +10,8 @@
 -- Incluye:
 --   - emparejamiento de una instalación (desafío breve, de un solo uso);
 --   - identificador público opaco y su regeneración;
+--   - código de recuperación de un solo uso y el flujo que reclama el mismo
+--     identificador público tras perder el secreto de enlace;
 --   - secreto de enlace, rotación con ventana de solapamiento e invalidación;
 --   - apertura, desplazamiento y caída del canal saliente Desktop -> relay;
 --   - detección de caída por latido y estados visibles de conexión;
@@ -25,9 +27,14 @@
 --
 -- Depende de:
 --   - Vera Desktop, que custodia el secreto de enlace en el almacén seguro del
---     sistema operativo; esa custodia es frontera, no está especificada aquí;
---   - un proveedor de identidad para la persona propietaria, todavía sin
---     decidir (ver preguntas abiertas).
+--     sistema operativo y muestra una sola vez el código de recuperación; esa
+--     custodia es frontera, no está especificada aquí.
+--
+-- No depende de un proveedor de identidad para la persona propietaria: en el
+-- relay no existe identidad de persona. Vera Desktop es el único principal
+-- autenticado del canal de control, y de ahí se sigue que ninguna acción de
+-- control (revocar, regenerar, retirar autorizaciones) puede ejercerse desde
+-- el relay mientras Desktop no esté presente: espera a que Desktop vuelva.
 --
 -- Nota de modelado: el estado "no_registrada" del diagrama de dominio no es un
 -- estado de la entidad sino la ausencia de la entidad: antes del reclamo del
@@ -74,12 +81,14 @@ entity Instalacion {
     secretos: SecretoDeEnlace with instalacion = this
     conexiones: ConexionDeEnlace with instalacion = this
     conexion_activa: ConexionDeEnlace with instalacion = this and estado = activa
+    codigos_de_recuperacion: CodigoDeRecuperacion with instalacion = this
 
     -- Proyecciones
     secretos_vigentes: secretos where estado = vigente
     secretos_solapados: secretos where estado = solapado
     secretos_utilizables: secretos where estado in {vigente, solapado}
     conexiones_activas: conexiones where estado = activa
+    recuperaciones_disponibles: codigos_de_recuperacion where estado = sin_usar
 
     -- Derivados
     esta_disponible: estado = conectada and conexiones_activas.count = 1
@@ -95,12 +104,23 @@ entity Instalacion {
     }
 
     invariant UnaSolaConexionActiva {
-        -- Una conexión Desktop activa a la vez por instalación.
+        -- Una conexión Desktop activa a la vez por instalación: la conexión
+        -- nueva desplaza a la anterior. Confirmado explícitamente por el dueño
+        -- del producto; no es una limitación aceptada por comodidad. El acceso
+        -- desde varios dispositivos no se resuelve aquí sino en
+        -- client-grants.allium, donde cada dispositivo es un cliente MCP
+        -- distinto con sus propios alcances.
         conexiones_activas.count <= 1
     }
 
     invariant RevocadaNoConservaSecretosUtilizables {
         estado = revocada implies secretos_utilizables.count = 0
+    }
+
+    invariant RevocadaNoConservaRecuperacionDisponible {
+        -- Revocar cierra también el camino de vuelta: un código de
+        -- recuperación no reabre una instalación revocada.
+        estado = revocada implies recuperaciones_disponibles.count = 0
     }
 }
 
@@ -119,6 +139,24 @@ entity DesafioDeEmparejamiento {
         pendiente -> reclamado
         pendiente -> caducado
         terminal: reclamado, caducado
+    }
+}
+
+entity CodigoDeRecuperacion {
+    -- Único camino de vuelta a un identificador público ya emitido. Se emite
+    -- una sola vez, al emparejar, junto al identificador público y al primer
+    -- secreto de enlace; Vera Desktop lo muestra una vez y la persona lo
+    -- guarda fuera del equipo. El relay sólo conserva su hash.
+    instalacion: Instalacion
+    hash_del_codigo: String
+    emitido_en: Timestamp
+    estado: sin_usar | usado | invalidado
+    usado_en: Timestamp when estado = usado
+
+    transitions estado {
+        sin_usar -> usado
+        sin_usar -> invalidado
+        terminal: usado, invalidado
     }
 }
 
@@ -160,10 +198,10 @@ entity ConexionDeEnlace {
 ------------------------------------------------------------
 
 config {
-    -- Valores iniciales del piloto. Las duraciones siguen abiertas (ver
-    -- preguntas abiertas): están aquí para que ninguna regla las esconda.
+    -- Valores del piloto, decididos por el dueño del producto. Están aquí para
+    -- que ninguna regla los esconda.
     vigencia_del_desafio: Duration = 10.minutes
-    solapamiento_de_rotacion: Duration = 5.minutes
+    solapamiento_de_rotacion: Duration = 30.minutes
     umbral_de_latido: Duration = 60.seconds
     bits_de_entropia_id_publico: Integer = 128
     bits_de_entropia_secreto: Integer = 256
@@ -212,10 +250,23 @@ rule ReclamarEmparejamiento {
             emitido_en: now,
             estado: vigente
         )
+        CodigoDeRecuperacion.created(
+            instalacion: instalacion,
+            hash_del_codigo: hash(codigo_de_un_solo_uso(config.bits_de_entropia_secreto)),
+            emitido_en: now,
+            estado: sin_usar
+        )
         EmparejamientoCompletado(
             instalacion: instalacion,
             version_ofrecida: desafio.version_ofrecida
         )
+
+    @guidance
+        -- El emparejamiento entrega tres cosas y sólo una vez: identificador
+        -- público, secreto de enlace y código de recuperación. Desktop custodia
+        -- el secreto y muestra el código de recuperación una única vez, con la
+        -- instrucción de guardarlo fuera del equipo: es lo único que permite
+        -- reclamar después este mismo identificador público.
 }
 
 rule DesafioDeEmparejamientoCaduca {
@@ -234,6 +285,8 @@ rule EmparejamientoNoCompletadoSeRevoca {
         instalacion.revocada_en = now
         for s in instalacion.secretos_vigentes:
             s.estado = invalidado
+        for r in instalacion.recuperaciones_disponibles:
+            r.estado = invalidado
         InstalacionRevocada(instalacion: instalacion, motivo: emparejamiento_abandonado)
 }
 
@@ -378,6 +431,9 @@ rule SolapamientoDeRotacionExpira {
 rule RegenerarIdPublicoConCanalAbierto {
     -- Regenerar el ID público corta todas las URL anteriores, incluida la del
     -- propio canal: Desktop debe volver a conectar con el identificador nuevo.
+    -- Es una operación de ruteo, no de autorización: no toca las concesiones
+    -- de client-grants.allium, que sobreviven intactas al cambio de
+    -- identificador. Retirar autorizaciones es una acción distinta y explícita.
     when: DesktopRegeneraIdPublico(instalacion)
     requires: instalacion.estado = conectada
     ensures:
@@ -399,6 +455,73 @@ rule RegenerarIdPublicoSinCanal {
         IdPublicoRegenerado(instalacion: instalacion)
 }
 
+-- Recuperar --------------------------------------------------------------
+
+rule RecuperarInstalacionSinCanal {
+    -- Flujo de recuperación deliberado: quien presenta el código guardado
+    -- fuera del equipo reclama el mismo identificador público y autentica un
+    -- secreto de enlace nuevo. Sin ese código, perder el secreto obliga a
+    -- emparejar de cero, con un identificador público distinto y las URL
+    -- anteriores rotas.
+    when: DesktopReclamaRecuperacion(recuperacion, codigo)
+    requires: recuperacion.estado = sin_usar
+    requires: recuperacion.instalacion.estado = desconectada
+    requires: verifica(codigo, recuperacion.hash_del_codigo)
+    ensures:
+        recuperacion.estado = usado
+        recuperacion.usado_en = now
+        for s in recuperacion.instalacion.secretos_vigentes:
+            s.estado = invalidado
+        for s in recuperacion.instalacion.secretos_solapados:
+            s.estado = invalidado
+            s.solapamiento_expira_en = null
+        SecretoDeEnlace.created(
+            instalacion: recuperacion.instalacion,
+            hash: hash(secreto_nuevo(config.bits_de_entropia_secreto)),
+            emitido_en: now,
+            estado: vigente
+        )
+        InstalacionRecuperada(instalacion: recuperacion.instalacion)
+
+    @guidance
+        -- Recuperar no crea una instalación nueva: conserva el identificador
+        -- público y, con él, las URL en circulación y las autorizaciones de
+        -- cliente ya concedidas. Invalidar el secreto anterior es parte de la
+        -- operación, no un efecto colateral.
+}
+
+rule RecuperarInstalacionConCanalAbierto {
+    -- Si el equipo anterior sigue conectado, recuperar lo desplaza: el secreto
+    -- con el que sostiene el canal deja de ser utilizable en el acto.
+    when: DesktopReclamaRecuperacion(recuperacion, codigo)
+    requires: recuperacion.estado = sin_usar
+    requires: recuperacion.instalacion.estado = conectada
+    requires: verifica(codigo, recuperacion.hash_del_codigo)
+    ensures:
+        recuperacion.estado = usado
+        recuperacion.usado_en = now
+        for s in recuperacion.instalacion.secretos_vigentes:
+            s.estado = invalidado
+        for s in recuperacion.instalacion.secretos_solapados:
+            s.estado = invalidado
+            s.solapamiento_expira_en = null
+        SecretoDeEnlace.created(
+            instalacion: recuperacion.instalacion,
+            hash: hash(secreto_nuevo(config.bits_de_entropia_secreto)),
+            emitido_en: now,
+            estado: vigente
+        )
+        for c in recuperacion.instalacion.conexiones_activas:
+            c.estado = cerrada
+            c.cerrada_en = now
+        recuperacion.instalacion.estado = desconectada
+        VeraDesconectada(
+            instalacion: recuperacion.instalacion,
+            motivo: recuperacion_de_instalacion
+        )
+        InstalacionRecuperada(instalacion: recuperacion.instalacion)
+}
+
 -- Revocar ----------------------------------------------------------------
 
 rule RevocarInstalacion {
@@ -415,6 +538,8 @@ rule RevocarInstalacion {
         for c in instalacion.conexiones_activas:
             c.estado = cerrada
             c.cerrada_en = now
+        for r in instalacion.recuperaciones_disponibles:
+            r.estado = invalidado
         InstalacionRevocada(instalacion: instalacion, motivo: revocacion_de_la_persona)
 }
 
@@ -495,6 +620,33 @@ surface ReclamoDeEmparejamiento {
         DesafioDeEmparejamientoCaduca
 }
 
+surface ReclamoDeRecuperacion {
+    -- Camino de vuelta tras perder el secreto de enlace o reinstalar el
+    -- sistema operativo. No autentica a nadie por credencial previa: exige el
+    -- código que la persona guardó fuera del equipo.
+    context recuperacion: CodigoDeRecuperacion where estado = sin_usar
+
+    exposes:
+        recuperacion.emitido_en
+
+    provides:
+        DesktopReclamaRecuperacion(recuperacion, codigo)
+
+    @guarantee RecuperacionDeUnSoloUso
+        -- Un código de recuperación se consume en el primer uso correcto. Un
+        -- segundo intento con el mismo código no produce otro secreto de
+        -- enlace.
+
+    @guarantee RecuperarConservaLaIdentidad
+        -- Recuperar reautentica la instalación existente y conserva su
+        -- identificador público: no crea una instalación nueva, no rompe las
+        -- URL en circulación y no toca las autorizaciones de cliente.
+
+    @guarantee RecuperacionNoReabreLoRevocado
+        -- El código de una instalación revocada ya no sirve: revocar lo
+        -- invalida junto con los secretos.
+}
+
 surface CanalDeEnlace {
     facing conector: ConectorDesktop
 
@@ -538,6 +690,7 @@ surface ControlDeInstalacion {
         conector.esta_disponible
         conector.creada_en
         conector.id_publico_rotado_en
+        conector.recuperaciones_disponibles.count
 
     provides:
         DesktopRegeneraIdPublico(conector)
@@ -547,6 +700,18 @@ surface ControlDeInstalacion {
         -- El estado se presenta como "Vera conectada", "Vera desconectada" o
         -- "acceso revocado". Un error de red genérico no es un estado válido
         -- para una persona no técnica.
+
+    @guarantee DesktopEsElUnicoPrincipalDeControl
+        -- No existe identidad de persona propietaria en el relay: Vera Desktop
+        -- es el único principal autenticado del canal de control. Ninguna
+        -- acción de control se ejerce desde el relay mientras Desktop no esté
+        -- presente; las decisiones esperan a que Desktop vuelva. El relay no
+        -- ofrece ninguna consola alternativa con inicio de sesión de persona.
+
+    @guarantee RegenerarNoRevocaAutorizaciones
+        -- Regenerar el identificador público es ruteo, no autorización:
+        -- conserva las autorizaciones de cliente ya concedidas. Retirarlas es
+        -- una acción distinta y explícita, que vive en client-grants.allium.
 
     @guidance
         -- Regenerar el identificador público es una operación destructiva
@@ -558,12 +723,4 @@ surface ControlDeInstalacion {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "¿Cuánto dura realmente el código de emparejamiento y la ventana de solapamiento de rotación? Los valores de config son provisionales del piloto."
-
-open question "¿Se permite más de una conexión Desktop simultánea por instalación? El modelo actual desplaza la conexión anterior; hace falta confirmar que ese es el comportamiento querido y no una limitación aceptada por comodidad."
-
-open question "¿Qué significa recuperar una instalación después de reinstalar el sistema operativo o perder el almacén de secretos? Hoy sólo existe emparejar de nuevo, lo que produce una instalación distinta y rompe las URL en circulación."
-
-open question "¿Regenerar el identificador público conserva las autorizaciones de cliente o las revoca? Esta spec sólo corta el canal; la decisión afecta directamente a client-grants.allium."
-
-open question "¿Existe una identidad de persona propietaria en el relay, o Vera Desktop es el único principal autenticado del canal de control? De ello depende si puede haber control cuando Desktop está apagada."
+open question "Tras consumir el código de recuperación, ¿el relay emite uno nuevo para la misma instalación, o queda sin segunda recuperación posible hasta reemparejar? La emisión inicial está decidida; la reemisión no."

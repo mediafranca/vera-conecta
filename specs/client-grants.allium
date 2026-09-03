@@ -10,9 +10,13 @@
 -- Incluye:
 --   - alta de un cliente autorizado por instalación;
 --   - concesión de alcances y evidencia de consentimiento;
---   - emisión de la credencial del cliente y su expiración;
+--   - emisión de la credencial de acceso, su vencimiento y su refresco;
 --   - revocación por cliente y revocación en cascada al revocar la instalación;
 --   - obligación de traducción de alcance remoto a permiso Vera local.
+--
+-- Alcance del piloto: lectura y escritura desde el primer día. No hay fase
+-- intermedia de sólo lectura; lo que limita a un cliente son sus alcances
+-- concedidos, no el calendario del proyecto.
 --
 -- Excluye:
 --   - emparejamiento y canal de enlace (ver installation-link.allium);
@@ -22,22 +26,21 @@
 --     vivir en una spec de biblioteca aparte cuando se decida el proveedor.
 --
 -- Depende de:
---   - installation-link.allium para la identidad de la instalación;
+--   - installation-link.allium para la identidad de la instalación y para el
+--     hecho de que en el relay no existe identidad de persona propietaria;
 --   - Vera local, que es la autoridad final de permisos: los alcances de esta
---     spec son un techo, nunca una concesión efectiva;
---   - un proveedor de identidad y consentimiento todavía sin decidir.
+--     spec son un techo, nunca una concesión efectiva.
+--
+-- De la ausencia de identidad de persona se sigue algo que conviene decir sin
+-- rodeos: autorizar y revocar dependen del canal Desktop <-> relay. Con Vera
+-- Desktop apagada no existe ninguna vía alternativa de control; la decisión
+-- espera a que Desktop vuelva.
 
 use "./installation-link.allium" as enlace
 
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
-
-external entity Persona {
-    -- La persona propietaria. Su identidad la administra un proveedor todavía
-    -- sin decidir; el relay sólo recibiría una referencia opaca.
-    referencia_opaca: String
-}
 
 external entity CredencialVeraLocal {
     -- Vive en Vera Desktop y nunca llega al relay. Aparece aquí sólo como
@@ -63,6 +66,13 @@ contract TraduccionDeAlcance {
         -- La asociación remoto -> credencial local vive en Desktop. Ningún
         -- campo de la solicitud puede elegir participante ni credencial.
 
+    @invariant BorradoSoloDeLoPropio
+        -- El alcance delete faculta a un cliente para borrar o deshacer
+        -- únicamente el contenido que él mismo creó, identificado por su
+        -- originId. Nunca contenido de otro cliente ni contenido escrito por
+        -- la persona. La comprobación es de Vera local; el relay sólo
+        -- transporta la identidad con la que se hizo.
+
     @guidance
         -- Si no existe una credencial local de alcance suficientemente
         -- estrecho, la respuesta correcta es negar la operación, no promover
@@ -74,12 +84,20 @@ contract TraduccionDeAlcance {
 ------------------------------------------------------------
 
 enum Alcance {
-    -- Alcances de producto del piloto. La lista está deliberadamente corta;
-    -- ver preguntas abiertas.
-    read | write
+    -- Alcances de producto del piloto, cerrados por el dueño del producto.
+    -- read: leer el grafo dentro de lo que Vera local permita.
+    -- write: crear y editar contenido atribuido a este cliente.
+    -- delete: borrar o deshacer únicamente el contenido que este mismo cliente
+    --   creó, rastreado por originId. Nunca contenido de otros clientes ni de
+    --   la persona; ver el contrato TraduccionDeAlcance.
+    read | write | delete
 }
 
 enum EvidenciaDeConsentimiento {
+    -- bearer_del_piloto: la persona generó manualmente el bearer desde Vera
+    --   Desktop para ese cliente concreto. La prueba de consentimiento es ese
+    --   acto local y explícito, no un flujo remoto: nadie puede obtener una
+    --   credencial sin que la persona la haya emitido delante de su equipo.
     bearer_del_piloto
     | confirmacion_en_desktop
     | oauth_con_consentimiento_explicito
@@ -91,14 +109,23 @@ enum EvidenciaDeConsentimiento {
 
 entity ClienteAutorizado {
     -- Una identidad por aplicación o dispositivo remoto. Revocar Claude no
-    -- desconecta ChatGPT porque son dos instancias distintas de esta entidad.
+    -- desconecta ChatGPT porque son dos instancias distintas de esta entidad,
+    -- y por lo mismo el mismo producto en dos equipos son dos clientes.
     instalacion: enlace/Instalacion
     principal_id: String
+    -- Etiqueta que elige la persona ("Claude en mi laptop"). Es dato de
+    -- control admitido y persistible; ver privacy-and-audit.allium.
     etiqueta_de_aplicacion: String
-    estado: pendiente | autorizado | revocado | expirado
+    estado: pendiente | autorizado | credencial_vencida | revocado | expirado
     creado_en: Timestamp
+
+    -- Vencimiento de la credencial de acceso: corto y renovable.
     expira_en: Timestamp when estado = pendiente | autorizado
     hash_de_credencial: String when estado = autorizado
+    -- Ventana de refresco: larga, y es la que decide cuándo termina de verdad
+    -- el acceso de una aplicación que nadie revocó.
+    hash_de_refresco: String when estado = autorizado | credencial_vencida
+    refresco_expira_en: Timestamp when estado = autorizado | credencial_vencida
     revocado_en: Timestamp when estado = revocado
 
     concesion: Concesion with cliente = this
@@ -107,8 +134,12 @@ entity ClienteAutorizado {
         pendiente -> autorizado
         pendiente -> revocado
         pendiente -> expirado
+        autorizado -> credencial_vencida
         autorizado -> revocado
         autorizado -> expirado
+        credencial_vencida -> autorizado
+        credencial_vencida -> revocado
+        credencial_vencida -> expirado
         terminal: revocado, expirado
     }
 }
@@ -118,7 +149,6 @@ entity Concesion {
     cliente: ClienteAutorizado
     alcances: Set<Alcance>
     otorgada_en: Timestamp
-    otorgada_por: Persona?
     evidencia: EvidenciaDeConsentimiento
     estado: vigente | retirada
     retirada_en: Timestamp when estado = retirada
@@ -141,8 +171,10 @@ entity Concesion {
 ------------------------------------------------------------
 
 config {
-    vigencia_de_autorizacion_pendiente: Duration = 15.minutes
-    vigencia_de_credencial: Duration = 30.days
+    -- Duraciones del piloto, decididas por el dueño del producto.
+    vigencia_de_autorizacion_pendiente: Duration = 10.minutes
+    vigencia_de_credencial_de_acceso: Duration = 1.hour
+    ventana_de_refresco: Duration = 90.days
     bits_de_entropia_credencial: Integer = 256
 }
 
@@ -183,13 +215,48 @@ rule EmitirCredencialDeCliente {
     ensures:
         cliente.estado = autorizado
         cliente.hash_de_credencial = hash(secreto_nuevo(config.bits_de_entropia_credencial))
-        cliente.expira_en = now + config.vigencia_de_credencial
+        cliente.expira_en = now + config.vigencia_de_credencial_de_acceso
+        cliente.hash_de_refresco = hash(secreto_nuevo(config.bits_de_entropia_credencial))
+        cliente.refresco_expira_en = now + config.ventana_de_refresco
         CredencialDeClienteEmitida(cliente: cliente)
 
     @guidance
-        -- La credencial se muestra una vez y sólo se conserva su hash con
-        -- pepper operacional. El relay no puede reconstruirla ni mostrarla de
-        -- nuevo: si se pierde, se autoriza otro cliente.
+        -- Se entregan dos credenciales de una vez: una de acceso, corta, y una
+        -- de refresco, larga. Ambas se muestran una sola vez y sólo se
+        -- conserva su hash con pepper operacional. El relay no puede
+        -- reconstruirlas ni mostrarlas de nuevo: si se pierden, se autoriza
+        -- otro cliente.
+}
+
+-- Refrescar ---------------------------------------------------------------
+
+rule CredencialDeAccesoVence {
+    -- Vencer no es perder el acceso: la aplicación conserva su concesión y
+    -- puede volver a operar presentando la credencial de refresco.
+    when: cliente: ClienteAutorizado.expira_en <= now
+    requires: cliente.estado = autorizado
+    ensures:
+        cliente.estado = credencial_vencida
+        cliente.expira_en = null
+        cliente.hash_de_credencial = null
+}
+
+rule RefrescarCredencialDeCliente {
+    when: ClienteRefrescaCredencial(cliente, prueba_de_refresco)
+    requires: cliente.estado = credencial_vencida
+    requires: cliente.refresco_expira_en > now
+    requires: verifica(prueba_de_refresco, cliente.hash_de_refresco)
+    ensures:
+        cliente.estado = autorizado
+        cliente.hash_de_credencial = hash(secreto_nuevo(config.bits_de_entropia_credencial))
+        cliente.expira_en = now + config.vigencia_de_credencial_de_acceso
+        CredencialDeClienteRefrescada(cliente: cliente)
+
+    @guidance
+        -- Refrescar no reabre el consentimiento ni amplía alcances: devuelve
+        -- una credencial de acceso nueva para la concesión que ya existía. Un
+        -- cliente revocado no refresca, porque revocar borra el hash de
+        -- refresco en el acto.
 }
 
 -- Expirar ----------------------------------------------------------------
@@ -205,12 +272,28 @@ rule AutorizacionPendienteCaduca {
 }
 
 rule CredencialDeClienteExpira {
-    when: cliente: ClienteAutorizado.expira_en <= now
+    -- Fin real del acceso: se agotó la ventana de refresco sin que nadie la
+    -- usara mientras la credencial de acceso seguía viva.
+    when: cliente: ClienteAutorizado.refresco_expira_en <= now
     requires: cliente.estado = autorizado
     ensures:
         cliente.estado = expirado
         cliente.expira_en = null
         cliente.hash_de_credencial = null
+        cliente.hash_de_refresco = null
+        cliente.refresco_expira_en = null
+        cliente.concesion.estado = retirada
+        cliente.concesion.retirada_en = now
+        AccesoDeClienteTerminado(cliente: cliente, motivo: expiracion)
+}
+
+rule VentanaDeRefrescoSeAgota {
+    when: cliente: ClienteAutorizado.refresco_expira_en <= now
+    requires: cliente.estado = credencial_vencida
+    ensures:
+        cliente.estado = expirado
+        cliente.hash_de_refresco = null
+        cliente.refresco_expira_en = null
         cliente.concesion.estado = retirada
         cliente.concesion.retirada_en = now
         AccesoDeClienteTerminado(cliente: cliente, motivo: expiracion)
@@ -238,6 +321,8 @@ rule RevocarClienteAutorizado {
         cliente.revocado_en = now
         cliente.expira_en = null
         cliente.hash_de_credencial = null
+        cliente.hash_de_refresco = null
+        cliente.refresco_expira_en = null
         cliente.concesion.estado = retirada
         cliente.concesion.retirada_en = now
         AccesoDeClienteTerminado(cliente: cliente, motivo: revocacion_de_la_persona)
@@ -245,7 +330,25 @@ rule RevocarClienteAutorizado {
     @guidance
         -- Revocar es una operación de control, no de limpieza diferida: desde
         -- este instante la credencial deja de autenticar aunque el cliente la
-        -- siga presentando y aunque Desktop esté desconectada.
+        -- siga presentando y aunque el canal caiga un segundo después. Lo que
+        -- sí exige la revocación es que Vera Desktop esté ahí para pedirla: no
+        -- hay identidad de persona en el relay que pueda pedirla en su lugar.
+}
+
+rule RevocarClienteConCredencialVencida {
+    -- Una aplicación cuya credencial de acceso venció sigue pudiendo
+    -- refrescar: retirarle el acceso debe ser posible sin esperar a que lo
+    -- haga.
+    when: DesktopRevocaCliente(cliente)
+    requires: cliente.estado = credencial_vencida
+    ensures:
+        cliente.estado = revocado
+        cliente.revocado_en = now
+        cliente.hash_de_refresco = null
+        cliente.refresco_expira_en = null
+        cliente.concesion.estado = retirada
+        cliente.concesion.retirada_en = now
+        AccesoDeClienteTerminado(cliente: cliente, motivo: revocacion_de_la_persona)
 }
 
 rule RevocarClientesPendientesAlRevocarInstalacion {
@@ -271,6 +374,23 @@ rule RevocarClientesAutorizadosAlRevocarInstalacion {
             cliente.revocado_en = now
             cliente.expira_en = null
             cliente.hash_de_credencial = null
+            cliente.hash_de_refresco = null
+            cliente.refresco_expira_en = null
+            cliente.concesion.estado = retirada
+            cliente.concesion.retirada_en = now
+            AccesoDeClienteTerminado(cliente: cliente, motivo: instalacion_revocada)
+}
+
+rule RevocarClientesConCredencialVencidaAlRevocarInstalacion {
+    when: enlace/InstalacionRevocada(inst, motivo)
+    for cliente in ClientesAutorizados where estado = credencial_vencida:
+        requires: cliente.instalacion = inst
+        requires: cliente.estado = credencial_vencida
+        ensures:
+            cliente.estado = revocado
+            cliente.revocado_en = now
+            cliente.hash_de_refresco = null
+            cliente.refresco_expira_en = null
             cliente.concesion.estado = retirada
             cliente.concesion.retirada_en = now
             AccesoDeClienteTerminado(cliente: cliente, motivo: instalacion_revocada)
@@ -295,9 +415,17 @@ invariant ConcesionUnicaPorCliente {
 }
 
 invariant CredencialSoloMientrasAutoriza {
-    -- Sólo un cliente autorizado tiene un hash de credencial almacenado.
+    -- Sólo un cliente autorizado tiene un hash de credencial de acceso
+    -- almacenado. Vencida la credencial, no queda nada con qué operar.
     for c in ClientesAutorizados:
         c.estado = autorizado implies c.hash_de_credencial != null
+}
+
+invariant RefrescoSoloMientrasHayConcesion {
+    -- Un cliente que conserva credencial de refresco conserva su concesión
+    -- vigente: refrescar nunca revive un acceso ya retirado.
+    for c in ClientesAutorizados:
+        c.estado in {autorizado, credencial_vencida} implies c.concesion.estado = vigente
 }
 
 ------------------------------------------------------------
@@ -309,7 +437,7 @@ actor ConectorDesktop {
 }
 
 actor ClienteMcp {
-    identified_by: ClienteAutorizado where estado in {pendiente, autorizado}
+    identified_by: ClienteAutorizado where estado in {pendiente, autorizado, credencial_vencida}
 }
 
 ------------------------------------------------------------
@@ -341,20 +469,37 @@ surface ConsentimientoYClientes {
     @guarantee RevocarUnoNoAfectaAOtros
         -- Retirar el acceso de una aplicación no interrumpe el enlace de la
         -- instalación ni el acceso de las demás aplicaciones autorizadas.
+        -- Retirar todas las autorizaciones es exactamente eso: retirarlas una
+        -- por una desde aquí. Es una acción distinta de regenerar el
+        -- identificador público, que no revoca nada.
 
     @guarantee LaCredencialNoSeMuestraDosVeces
         -- Esta superficie nunca expone la credencial de un cliente ya
         -- emitido, sólo su estado y sus alcances.
+
+    @guarantee ControlSoloConDesktopPresente
+        -- Autorizar y revocar exigen a Vera Desktop, que es el único principal
+        -- autenticado del canal de control. En el relay no hay identidad de
+        -- persona (ver installation-link.allium): con Desktop apagada no queda
+        -- ninguna vía alternativa y la decisión espera a que Desktop vuelva.
+
+    @guarantee LaEtiquetaEsDeLaPersona
+        -- La etiqueta de aplicación la elige la persona y se conserva como
+        -- dato de control. Sirve para que reconozca qué está autorizando; no
+        -- se deriva del contenido ni del tráfico del cliente.
 }
 
 surface ControlDeClienteAutorizado {
     -- Una aplicación concreta, vista desde el control de la persona.
-    context cliente: ClienteAutorizado where estado in {pendiente, autorizado}
+    context cliente: ClienteAutorizado
+        where estado in {pendiente, autorizado, credencial_vencida}
 
     exposes:
         cliente.etiqueta_de_aplicacion
         cliente.estado
-        cliente.expira_en
+        cliente.expira_en when cliente.estado in {pendiente, autorizado}
+        cliente.refresco_expira_en
+            when cliente.estado in {autorizado, credencial_vencida}
         cliente.concesion.alcances
         cliente.concesion.evidencia
 
@@ -363,7 +508,8 @@ surface ControlDeClienteAutorizado {
 
     @guarantee RevocacionInmediata
         -- Tras revocar, ninguna solicitud nueva de ese cliente se autentica,
-        -- aunque presente una credencial que todavía no ha expirado.
+        -- aunque presente una credencial que todavía no ha expirado y aunque
+        -- conserve la de refresco.
 
     timeout:
         CredencialDeClienteExpira
@@ -380,10 +526,20 @@ surface ReclamoDeCredencial {
     provides:
         ClienteReclamaCredencial(cliente, prueba_de_consentimiento)
             when cliente.estado = pendiente
+        ClienteRefrescaCredencial(cliente, prueba_de_refresco)
+            when cliente.estado = credencial_vencida
 
     @guarantee ConsentimientoAntesQueCredencial
         -- No se emite credencial sin evidencia de consentimiento registrada
-        -- en la concesión.
+        -- en la concesión. En el piloto esa evidencia es bearer_del_piloto:
+        -- la persona generó manualmente el bearer desde Vera Desktop para este
+        -- cliente. El consentimiento es ese acto local y explícito; el relay
+        -- no lo simula ni lo infiere de un flujo remoto.
+
+    @guarantee RefrescarNoAmpliaNada
+        -- Refrescar devuelve una credencial de acceso para la concesión que ya
+        -- existe: mismos alcances, misma instalación, misma evidencia. Nunca
+        -- es una segunda autorización.
 
     timeout:
         AutorizacionPendienteCaduca
@@ -410,14 +566,4 @@ surface TraduccionDeIdentidadRemota {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "¿Qué alcances de producto existen además de read y write? El enum Alcance está fijado en dos valores sólo porque nadie ha nombrado un tercero."
-
-open question "¿El primer piloto admite escritura o empieza estrictamente en lectura? El plan de implementación sugiere lectura en M2 y escritura gobernada en M3, pero el producto no lo ha declarado."
-
-open question "¿Quién inicia y revoca autorizaciones si Vera Desktop está offline? Hoy todas las reglas de control entran por el conector; sin canal no hay forma de revocar desde el relay."
-
-open question "¿Cuánto duran la autorización pendiente, el access token y el refresh token? Los valores de config son provisionales y no hay modelo de refresh."
-
-open question "¿Cómo se prueba el consentimiento cuando el cliente no ofrece OAuth dinámico? La evidencia bearer_del_piloto documenta el hueco, no lo resuelve."
-
-open question "¿Es admisible persistir una etiqueta de aplicación elegida por la persona? No figura entre las clases de dato permitidas en privacy-and-audit.allium; o se clasifica como estado de control o se sustituye por un identificador opaco."
+open question "¿La credencial de refresco rota en cada uso, o vive los 90 días completos sin cambiar? La duración está decidida; la rotación no, y OAuth 2.1 la exige para clientes públicos."
