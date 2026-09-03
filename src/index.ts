@@ -54,6 +54,20 @@ export default {
       return installation.fetch(new Request(target, request));
     }
 
+    const controlMatch = url.pathname.match(/^\/v\/([^/]+)\/(rotate|rotate\/confirm|revoke)$/);
+    if (request.method === "POST" && controlMatch) {
+      const idPublico = decodeURIComponent(controlMatch[1]);
+      const bodyText = await request.text();
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      return installation.fetch(
+        new Request(`http://do/internal/${controlMatch[2]}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText,
+        }),
+      );
+    }
+
     return json(501, {
       error: "not_implemented",
       detail: "El relay permanece cerrado hasta que sus contratos estén especificados y probados.",

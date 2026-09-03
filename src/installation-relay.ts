@@ -8,6 +8,7 @@ export interface Env {
 
 // specs/installation-link.allium § config
 const VIGENCIA_DEL_DESAFIO_MS = 10 * 60_000;
+const SOLAPAMIENTO_DE_ROTACION_MS = 5 * 60_000;
 const UMBRAL_DE_LATIDO_MS = 60_000;
 const BITS_ENTROPIA_ID_PUBLICO = 128;
 const BITS_ENTROPIA_SECRETO = 256;
@@ -89,6 +90,15 @@ export class InstallationRelay extends DurableObject<Env> {
     }
     if (request.method === "GET" && url.pathname === "/internal/link") {
       return this.abrirCanal(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/rotate") {
+      return this.rotarSecreto(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/rotate/confirm") {
+      return this.confirmarRotacion(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/revoke") {
+      return this.revocar(request);
     }
     return json(404, { error: "ruta_interna_desconocida" });
   }
@@ -299,6 +309,96 @@ export class InstallationRelay extends DurableObject<Env> {
     await this.scheduleNextAlarm();
 
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Credencial compartida por rotate/rotate-confirm/revoke: misma prueba de
+  // posesión del secreto que abre el canal, pero por HTTP y sin exigir que
+  // haya un WebSocket abierto (ver surface ControlDeInstalacion).
+  private async leerCredencialDesdeBody(request: Request): Promise<InstalacionRow | null> {
+    const body = (await request.json().catch(() => null)) as { prueba_de_secreto?: unknown } | null;
+    const pruebaDeSecreto = body?.prueba_de_secreto;
+    if (typeof pruebaDeSecreto !== "string" || pruebaDeSecreto.length === 0) return null;
+
+    const instalacion = this.leerInstalacion();
+    if (!instalacion) return null;
+
+    const secretosUtilizables = this.ctx.storage.sql
+      .exec<{ hash: string }>(`SELECT hash FROM secretos WHERE estado IN ('vigente', 'solapado')`)
+      .toArray();
+    for (const secreto of secretosUtilizables) {
+      if (await verifyWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, pruebaDeSecreto, secreto.hash)) {
+        return instalacion;
+      }
+    }
+    return null;
+  }
+
+  // rule RotarSecretoDeEnlace
+  private async rotarSecreto(request: Request): Promise<Response> {
+    const instalacion = await this.leerCredencialDesdeBody(request);
+    if (!instalacion) return json(401, { error: "credencial_de_enlace_invalida" });
+    if (instalacion.estado !== "conectada" && instalacion.estado !== "desconectada") {
+      return json(409, { error: "instalacion_no_permite_rotacion" });
+    }
+
+    const vigentes = this.ctx.storage.sql.exec(`SELECT id FROM secretos WHERE estado = 'vigente'`).toArray();
+    if (vigentes.length === 0) return json(409, { error: "sin_secreto_vigente" });
+
+    const now = Date.now();
+    const solapamientoExpiraEn = now + SOLAPAMIENTO_DE_ROTACION_MS;
+    this.ctx.storage.sql.exec(
+      `UPDATE secretos SET estado = 'solapado', solapamiento_expira_en = ? WHERE estado = 'vigente'`,
+      solapamientoExpiraEn,
+    );
+
+    const nuevoSecreto = randomToken(BITS_ENTROPIA_SECRETO);
+    const nuevoHash = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, nuevoSecreto);
+    this.ctx.storage.sql.exec(`INSERT INTO secretos (hash, emitido_en, estado) VALUES (?, ?, 'vigente')`, nuevoHash, now);
+    await this.scheduleNextAlarm();
+
+    return json(201, {
+      secreto_de_enlace: nuevoSecreto,
+      solapamiento_expira_en: new Date(solapamientoExpiraEn).toISOString(),
+    });
+  }
+
+  // rule DesktopConfirmaRotacion
+  private async confirmarRotacion(request: Request): Promise<Response> {
+    const instalacion = await this.leerCredencialDesdeBody(request);
+    if (!instalacion) return json(401, { error: "credencial_de_enlace_invalida" });
+
+    const solapados = this.ctx.storage.sql.exec(`SELECT id FROM secretos WHERE estado = 'solapado'`).toArray();
+    if (solapados.length === 0) return json(409, { error: "sin_secreto_solapado" });
+
+    this.ctx.storage.sql.exec(
+      `UPDATE secretos SET estado = 'invalidado', solapamiento_expira_en = NULL WHERE estado = 'solapado'`,
+    );
+    return json(200, { ok: true });
+  }
+
+  // rule RevocarInstalacion
+  private async revocar(request: Request): Promise<Response> {
+    const instalacion = await this.leerCredencialDesdeBody(request);
+    if (!instalacion) return json(401, { error: "credencial_de_enlace_invalida" });
+    if (instalacion.estado === "revocada") {
+      return json(409, { error: "instalacion_ya_revocada" });
+    }
+
+    const now = Date.now();
+    for (const ws of this.ctx.getWebSockets("link")) {
+      ws.close(4002, "instalacion_revocada");
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE instalacion SET estado = 'revocada', revocada_en = ? WHERE id_publico = ?`,
+      now,
+      instalacion.id_publico,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE secretos SET estado = 'invalidado', solapamiento_expira_en = NULL WHERE estado IN ('vigente', 'solapado')`,
+    );
+    this.ctx.storage.sql.exec(`UPDATE conexiones SET estado = 'cerrada', cerrada_en = ? WHERE estado = 'activa'`, now);
+
+    return json(200, { ok: true });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {

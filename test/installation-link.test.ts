@@ -181,3 +181,87 @@ describe("aislamiento entre instalaciones", () => {
     wsB.close();
   });
 });
+
+async function controlar(idPublico: string, accion: "rotate" | "rotate/confirm" | "revoke", secreto: string): Promise<Response> {
+  return SELF.fetch(`https://vera-conecta.test/v/${idPublico}/${accion}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prueba_de_secreto: secreto }),
+  });
+}
+
+describe("rotación de secreto", () => {
+  it("rota el secreto y deja el anterior utilizable durante el solapamiento", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    // RotarSecretoDeEnlace exige estado conectada|desconectada: 'emparejando'
+    // (recién reclamada, sin canal abierto todavía) no basta.
+    const primerCanal = await abrirEnlace(id_publico, secreto_de_enlace, "conexion-inicial");
+    primerCanal.webSocket?.accept();
+
+    const rotacion = await controlar(id_publico, "rotate", secreto_de_enlace);
+    expect(rotacion.status).toBe(201);
+    const { secreto_de_enlace: nuevoSecreto } = (await rotacion.json()) as { secreto_de_enlace: string };
+    expect(nuevoSecreto).not.toBe(secreto_de_enlace);
+
+    // El secreto viejo (solapado) todavía abre el canal.
+    const canalConViejo = await abrirEnlace(id_publico, secreto_de_enlace, "conexion-vieja");
+    expect(canalConViejo.status).toBe(101);
+    canalConViejo.webSocket?.accept();
+    canalConViejo.webSocket?.close();
+
+    // El secreto nuevo también.
+    const canalConNuevo = await abrirEnlace(id_publico, nuevoSecreto, "conexion-nueva");
+    expect(canalConNuevo.status).toBe(101);
+    canalConNuevo.webSocket?.accept();
+    canalConNuevo.webSocket?.close();
+  });
+
+  it("confirmar la rotación invalida el secreto viejo de inmediato", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    const primerCanal = await abrirEnlace(id_publico, secreto_de_enlace, "conexion-inicial");
+    primerCanal.webSocket?.accept();
+
+    const rotacion = await controlar(id_publico, "rotate", secreto_de_enlace);
+    const { secreto_de_enlace: nuevoSecreto } = (await rotacion.json()) as { secreto_de_enlace: string };
+
+    const confirmacion = await controlar(id_publico, "rotate/confirm", nuevoSecreto);
+    expect(confirmacion.status).toBe(200);
+
+    const canalConViejo = await abrirEnlace(id_publico, secreto_de_enlace, "conexion-post-confirmacion");
+    expect(canalConViejo.status).toBe(401);
+  });
+
+  it("rechaza rotar con una credencial inválida", async () => {
+    const { id_publico } = await emparejarInstalacion();
+    const rotacion = await controlar(id_publico, "rotate", "secreto-que-no-es");
+    expect(rotacion.status).toBe(401);
+  });
+});
+
+describe("revocación", () => {
+  it("revoca la instalación, cierra el canal e invalida todos los secretos", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    const canal = await abrirEnlace(id_publico, secreto_de_enlace, "conexion-a-revocar");
+    const ws = canal.webSocket!;
+    ws.accept();
+    const cierre = esperarCierre(ws);
+
+    const revocacion = await controlar(id_publico, "revoke", secreto_de_enlace);
+    expect(revocacion.status).toBe(200);
+
+    const evento = await cierre;
+    expect(evento.code).toBe(4002);
+
+    const reintento = await abrirEnlace(id_publico, secreto_de_enlace, "conexion-tras-revocacion");
+    expect(reintento.status).toBe(401);
+  });
+
+  it("una segunda revocación no rompe nada, sólo informa que ya estaba revocada", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    const primera = await controlar(id_publico, "revoke", secreto_de_enlace);
+    expect(primera.status).toBe(200);
+
+    const segunda = await controlar(id_publico, "revoke", secreto_de_enlace);
+    expect(segunda.status).toBe(401);
+  });
+});
