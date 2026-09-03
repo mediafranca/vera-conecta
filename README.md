@@ -21,10 +21,20 @@ https://conecta.mediafranca.net/v/<id-publico>/mcp
 
 ## Estado
 
-El repositorio es un **contrato de diseño y esqueleto de infraestructura**. Aún
-no existe un relay utilizable ni debe conectarse una memoria real. `/health`
-responde; las rutas de producto contestan `501` deliberadamente hasta que sus
-comportamientos estén especificados y probados.
+**M0 completo, M1 en curso.** Las cinco specs Allium (`specs/*.allium`) fijan el
+contrato; cada una deja preguntas abiertas explícitas todavía sin decidir.
+
+El canal de enlace de `installation-link.allium` es el primer walking skeleton
+probado extremo a extremo, sin memoria real: emparejamiento de un solo uso,
+apertura del canal WebSocket hibernable, latido, desplazamiento de conexión,
+revocación por silencio o abandono, y un eco correlacionado por `request_id`
+que demuestra transporte de solicitud/respuesta. Nada de esto todavía toca
+MCP ni el grafo de Vera. `/health` responde; las rutas de producto que aún no
+tienen contrato probado (MCP, OAuth, control de instalación) contestan `501`
+deliberadamente.
+
+No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
+la suite sobre `@cloudflare/vitest-pool-workers`.
 
 ## Dirección acordada
 
