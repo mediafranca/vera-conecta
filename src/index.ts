@@ -90,7 +90,7 @@ export default {
       );
     }
 
-    const clientActionMatch = url.pathname.match(/^\/v\/([^/]+)\/clients\/([^/]+)\/(claim|revoke)$/);
+    const clientActionMatch = url.pathname.match(/^\/v\/([^/]+)\/clients\/([^/]+)\/(claim|refresh|revoke)$/);
     if (request.method === "POST" && clientActionMatch) {
       const idPublico = decodeURIComponent(clientActionMatch[1]);
       const principalId = decodeURIComponent(clientActionMatch[2]);

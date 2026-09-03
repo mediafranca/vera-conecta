@@ -17,10 +17,11 @@ const VERSION_MAXIMA_ADMITIDA = 1;
 const ALARM_TICK_MS = 15_000;
 
 // specs/client-grants.allium § config
-const VIGENCIA_DE_AUTORIZACION_PENDIENTE_MS = 15 * 60_000;
-const VIGENCIA_DE_CREDENCIAL_MS = 30 * 24 * 60 * 60_000;
+const VIGENCIA_DE_AUTORIZACION_PENDIENTE_MS = 10 * 60_000;
+const VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS = 60 * 60_000;
+const VENTANA_DE_REFRESCO_MS = 90 * 24 * 60 * 60_000;
 const BITS_ENTROPIA_CREDENCIAL = 256;
-const ALCANCES_VALIDOS = ["read", "write"] as const;
+const ALCANCES_VALIDOS = ["read", "write", "delete"] as const;
 type Alcance = (typeof ALCANCES_VALIDOS)[number];
 const EVIDENCIAS_VALIDAS = ["bearer_del_piloto", "confirmacion_en_desktop", "oauth_con_consentimiento_explicito"] as const;
 type Evidencia = (typeof EVIDENCIAS_VALIDAS)[number];
@@ -48,9 +49,10 @@ interface LinkAttachment {
 interface ClienteRow extends Record<string, SqlStorageValue> {
   principal_id: string;
   etiqueta_de_aplicacion: string;
-  estado: "pendiente" | "autorizado" | "revocado" | "expirado";
+  estado: "pendiente" | "autorizado" | "credencial_vencida" | "revocado" | "expirado";
   creado_en: number;
   expira_en: number | null;
+  refresco_expira_en: number | null;
 }
 
 export class InstallationRelay extends DurableObject<Env> {
@@ -99,6 +101,8 @@ export class InstallationRelay extends DurableObject<Env> {
       creado_en INTEGER NOT NULL,
       expira_en INTEGER,
       hash_de_credencial TEXT,
+      hash_de_refresco TEXT,
+      refresco_expira_en INTEGER,
       revocado_en INTEGER
     )`);
     sql.exec(`CREATE TABLE IF NOT EXISTS concesiones (
@@ -143,6 +147,10 @@ export class InstallationRelay extends DurableObject<Env> {
     const claimClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/claim$/);
     if (request.method === "POST" && claimClienteMatch) {
       return this.reclamarCredencialDeCliente(request, claimClienteMatch[1]);
+    }
+    const refreshClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/refresh$/);
+    if (request.method === "POST" && refreshClienteMatch) {
+      return this.refrescarCredencialDeCliente(request, refreshClienteMatch[1]);
     }
     const revokeClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/revoke$/);
     if (request.method === "POST" && revokeClienteMatch) {
@@ -435,11 +443,14 @@ export class InstallationRelay extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`UPDATE conexiones SET estado = 'cerrada', cerrada_en = ? WHERE estado = 'activa'`, now);
 
     // rules RevocarClientesPendientesAlRevocarInstalacion,
-    // RevocarClientesAutorizadosAlRevocarInstalacion — revocar la instalación
-    // arrastra a todos sus clientes, sin excepción.
+    // RevocarClientesAutorizadosAlRevocarInstalacion,
+    // RevocarClientesConCredencialVencidaAlRevocarInstalacion — revocar la
+    // instalación arrastra a todos sus clientes, sin excepción.
     this.ctx.storage.sql.exec(
-      `UPDATE clientes SET estado = 'revocado', revocado_en = ?, expira_en = NULL, hash_de_credencial = NULL
-       WHERE estado IN ('pendiente', 'autorizado')`,
+      `UPDATE clientes
+       SET estado = 'revocado', revocado_en = ?, expira_en = NULL,
+           hash_de_credencial = NULL, hash_de_refresco = NULL, refresco_expira_en = NULL
+       WHERE estado IN ('pendiente', 'autorizado', 'credencial_vencida')`,
       now,
     );
     this.ctx.storage.sql.exec(
@@ -508,7 +519,9 @@ export class InstallationRelay extends DurableObject<Env> {
     });
   }
 
-  // rule EmitirCredencialDeCliente
+  // rule EmitirCredencialDeCliente — entrega credencial de acceso (1h) y de
+  // refresco (90 días) de una vez; sólo la primera se vuelve a emitir sola en
+  // refrescarCredencialDeCliente.
   private async reclamarCredencialDeCliente(request: Request, principalId: string): Promise<Response> {
     const body = (await request.json().catch(() => null)) as { prueba_de_consentimiento?: unknown } | null;
     const pruebaDeConsentimiento = body?.prueba_de_consentimiento;
@@ -524,40 +537,95 @@ export class InstallationRelay extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    const nuevaExpiracion = now + VIGENCIA_DE_CREDENCIAL_MS;
-    const secreto = randomToken(BITS_ENTROPIA_CREDENCIAL);
-    const hash = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secreto);
+    const expiraEn = now + VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS;
+    const refrescoExpiraEn = now + VENTANA_DE_REFRESCO_MS;
+    const secretoDeAcceso = randomToken(BITS_ENTROPIA_CREDENCIAL);
+    const secretoDeRefresco = randomToken(BITS_ENTROPIA_CREDENCIAL);
+    const hashDeAcceso = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secretoDeAcceso);
+    const hashDeRefresco = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secretoDeRefresco);
 
     this.ctx.storage.sql.exec(
-      `UPDATE clientes SET estado = 'autorizado', hash_de_credencial = ?, expira_en = ? WHERE principal_id = ?`,
-      hash,
-      nuevaExpiracion,
+      `UPDATE clientes
+       SET estado = 'autorizado', hash_de_credencial = ?, expira_en = ?,
+           hash_de_refresco = ?, refresco_expira_en = ?
+       WHERE principal_id = ?`,
+      hashDeAcceso,
+      expiraEn,
+      hashDeRefresco,
+      refrescoExpiraEn,
       principalId,
     );
     await this.scheduleNextAlarm();
 
     const concesion = this.leerConcesion(principalId);
     return json(201, {
-      secreto_de_cliente: secreto,
+      secreto_de_cliente: secretoDeAcceso,
+      secreto_de_refresco: secretoDeRefresco,
       alcances: concesion?.alcances.split(",") ?? [],
-      expira_en: new Date(nuevaExpiracion).toISOString(),
+      expira_en: new Date(expiraEn).toISOString(),
+      refresco_expira_en: new Date(refrescoExpiraEn).toISOString(),
     });
   }
 
-  // rules RevocarClientePendiente, RevocarClienteAutorizado
+  // rule RefrescarCredencialDeCliente — no reabre consentimiento ni alcances:
+  // sólo repone la credencial de acceso mientras la de refresco siga viva.
+  private async refrescarCredencialDeCliente(request: Request, principalId: string): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as { prueba_de_refresco?: unknown } | null;
+    const pruebaDeRefresco = body?.prueba_de_refresco;
+    if (typeof pruebaDeRefresco !== "string" || pruebaDeRefresco.length === 0) {
+      return json(401, { error: "refresco_invalido" });
+    }
+
+    const cliente = this.leerCliente(principalId);
+    if (!cliente) return json(404, { error: "cliente_no_encontrado" });
+    if (cliente.estado !== "credencial_vencida") return json(409, { error: "cliente_no_tiene_credencial_vencida" });
+    if (!cliente.refresco_expira_en || cliente.refresco_expira_en <= Date.now()) {
+      return json(410, { error: "ventana_de_refresco_agotada" });
+    }
+
+    const hashDeRefrescoActual = this.leerHashDeRefresco(principalId);
+    if (!hashDeRefrescoActual || !(await verifyWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, pruebaDeRefresco, hashDeRefrescoActual))) {
+      return json(401, { error: "refresco_invalido" });
+    }
+
+    const now = Date.now();
+    const expiraEn = now + VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS;
+    const secretoDeAcceso = randomToken(BITS_ENTROPIA_CREDENCIAL);
+    const hashDeAcceso = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secretoDeAcceso);
+
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'autorizado', hash_de_credencial = ?, expira_en = ? WHERE principal_id = ?`,
+      hashDeAcceso,
+      expiraEn,
+      principalId,
+    );
+    await this.scheduleNextAlarm();
+
+    const concesion = this.leerConcesion(principalId);
+    return json(201, {
+      secreto_de_cliente: secretoDeAcceso,
+      alcances: concesion?.alcances.split(",") ?? [],
+      expira_en: new Date(expiraEn).toISOString(),
+    });
+  }
+
+  // rules RevocarClientePendiente, RevocarClienteAutorizado,
+  // RevocarClienteConCredencialVencida
   private async revocarCliente(request: Request, principalId: string): Promise<Response> {
     const instalacion = await this.leerCredencialDesdeBody(request);
     if (!instalacion) return json(401, { error: "credencial_de_enlace_invalida" });
 
     const cliente = this.leerCliente(principalId);
     if (!cliente) return json(404, { error: "cliente_no_encontrado" });
-    if (cliente.estado !== "pendiente" && cliente.estado !== "autorizado") {
+    if (cliente.estado !== "pendiente" && cliente.estado !== "autorizado" && cliente.estado !== "credencial_vencida") {
       return json(409, { error: "cliente_no_revocable" });
     }
 
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `UPDATE clientes SET estado = 'revocado', revocado_en = ?, expira_en = NULL, hash_de_credencial = NULL
+      `UPDATE clientes
+       SET estado = 'revocado', revocado_en = ?, expira_en = NULL,
+           hash_de_credencial = NULL, hash_de_refresco = NULL, refresco_expira_en = NULL
        WHERE principal_id = ?`,
       now,
       principalId,
@@ -573,7 +641,9 @@ export class InstallationRelay extends DurableObject<Env> {
 
   private async listarClientes(): Promise<Response> {
     const clientes = this.ctx.storage.sql
-      .exec<ClienteRow>(`SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en FROM clientes`)
+      .exec<ClienteRow>(
+        `SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en, refresco_expira_en FROM clientes`,
+      )
       .toArray();
     const concesiones = this.ctx.storage.sql
       .exec<{ cliente_principal_id: string; alcances: string; evidencia: string }>(
@@ -588,6 +658,14 @@ export class InstallationRelay extends DurableObject<Env> {
         etiqueta_de_aplicacion: c.etiqueta_de_aplicacion,
         estado: c.estado,
         creado_en: new Date(c.creado_en).toISOString(),
+        expira_en:
+          (c.estado === "pendiente" || c.estado === "autorizado") && c.expira_en
+            ? new Date(c.expira_en).toISOString()
+            : null,
+        refresco_expira_en:
+          (c.estado === "autorizado" || c.estado === "credencial_vencida") && c.refresco_expira_en
+            ? new Date(c.refresco_expira_en).toISOString()
+            : null,
         alcances: alcancesPorCliente.get(c.principal_id)?.alcances.split(",") ?? [],
         evidencia: alcancesPorCliente.get(c.principal_id)?.evidencia ?? null,
       })),
@@ -613,7 +691,8 @@ export class InstallationRelay extends DurableObject<Env> {
     return (
       this.ctx.storage.sql
         .exec<ClienteRow>(
-          `SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en FROM clientes WHERE principal_id = ?`,
+          `SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en, refresco_expira_en
+           FROM clientes WHERE principal_id = ?`,
           principalId,
         )
         .toArray()[0] ?? null
@@ -629,6 +708,16 @@ export class InstallationRelay extends DurableObject<Env> {
         )
         .toArray()[0] ?? null
     );
+  }
+
+  private leerHashDeRefresco(principalId: string): string | null {
+    const fila = this.ctx.storage.sql
+      .exec<{ hash_de_refresco: string | null }>(
+        `SELECT hash_de_refresco FROM clientes WHERE principal_id = ?`,
+        principalId,
+      )
+      .toArray()[0];
+    return fila?.hash_de_refresco ?? null;
   }
 
   // Verifica posesión del secreto de enlace sin exigir el resto del cuerpo
@@ -774,18 +863,45 @@ export class InstallationRelay extends DurableObject<Env> {
       now,
     );
 
-    // rule CredencialDeClienteExpira
+    // rule CredencialDeClienteExpira — caso límite: la ventana de refresco se
+    // agotó sin que nadie tocara la credencial de acceso todavía vigente.
     this.ctx.storage.sql.exec(
       `UPDATE concesiones SET estado = 'retirada', retirada_en = ?
        WHERE estado = 'vigente' AND cliente_principal_id IN (
-         SELECT principal_id FROM clientes WHERE estado = 'autorizado' AND expira_en <= ?
+         SELECT principal_id FROM clientes WHERE estado = 'autorizado' AND refresco_expira_en <= ?
        )`,
       now,
       now,
     );
     this.ctx.storage.sql.exec(
-      `UPDATE clientes SET estado = 'expirado', expira_en = NULL, hash_de_credencial = NULL
+      `UPDATE clientes
+       SET estado = 'expirado', expira_en = NULL, hash_de_credencial = NULL,
+           hash_de_refresco = NULL, refresco_expira_en = NULL
+       WHERE estado = 'autorizado' AND refresco_expira_en <= ?`,
+      now,
+    );
+
+    // rule CredencialDeAccesoVence — sólo lo que sigue autorizado tras el
+    // paso anterior: vencer no retira la concesión, sólo la credencial corta.
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'credencial_vencida', expira_en = NULL, hash_de_credencial = NULL
        WHERE estado = 'autorizado' AND expira_en <= ?`,
+      now,
+    );
+
+    // rule VentanaDeRefrescoSeAgota
+    this.ctx.storage.sql.exec(
+      `UPDATE concesiones SET estado = 'retirada', retirada_en = ?
+       WHERE estado = 'vigente' AND cliente_principal_id IN (
+         SELECT principal_id FROM clientes WHERE estado = 'credencial_vencida' AND refresco_expira_en <= ?
+       )`,
+      now,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes
+       SET estado = 'expirado', hash_de_refresco = NULL, refresco_expira_en = NULL
+       WHERE estado = 'credencial_vencida' AND refresco_expira_en <= ?`,
       now,
     );
 
@@ -805,7 +921,8 @@ export class InstallationRelay extends DurableObject<Env> {
       sql.exec(`SELECT 1 FROM instalacion WHERE estado = 'emparejando' LIMIT 1`).toArray().length > 0 ||
       sql.exec(`SELECT 1 FROM conexiones WHERE estado = 'activa' LIMIT 1`).toArray().length > 0 ||
       sql.exec(`SELECT 1 FROM secretos WHERE estado = 'solapado' LIMIT 1`).toArray().length > 0 ||
-      sql.exec(`SELECT 1 FROM clientes WHERE estado IN ('pendiente', 'autorizado') LIMIT 1`).toArray().length > 0;
+      sql.exec(`SELECT 1 FROM clientes WHERE estado IN ('pendiente', 'autorizado', 'credencial_vencida') LIMIT 1`).toArray()
+        .length > 0;
 
     if (hayPendientes) {
       await this.ctx.storage.setAlarm(Date.now() + ALARM_TICK_MS);

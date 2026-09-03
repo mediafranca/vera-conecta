@@ -70,6 +70,14 @@ async function revocarCliente(idPublico: string, principalId: string, secretoDeE
   });
 }
 
+async function refrescarCredencial(idPublico: string, principalId: string, pruebaDeRefresco: string): Promise<Response> {
+  return SELF.fetch(`https://vera-conecta.test/v/${idPublico}/clients/${principalId}/refresh`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prueba_de_refresco: pruebaDeRefresco }),
+  });
+}
+
 describe("autorización de clientes", () => {
   it("autoriza un cliente nuevo mientras la instalación está conectada", async () => {
     const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
@@ -104,6 +112,16 @@ describe("autorización de clientes", () => {
     const desconocido = await autorizarCliente(id_publico, secreto_de_enlace, "app", ["admin"]);
     expect(desconocido.status).toBe(400);
   });
+
+  it("acepta el alcance delete junto a read y write", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    await abrirEnlaceParaConectar(id_publico, secreto_de_enlace);
+
+    const respuesta = await autorizarCliente(id_publico, secreto_de_enlace, "app", ["read", "write", "delete"]);
+    expect(respuesta.status).toBe(201);
+    const cuerpo = (await respuesta.json()) as AutorizacionPendiente;
+    expect(cuerpo.alcances.sort()).toEqual(["delete", "read", "write"]);
+  });
 });
 
 describe("reclamo de credencial", () => {
@@ -115,9 +133,18 @@ describe("reclamo de credencial", () => {
 
     const reclamo = await reclamarCredencial(id_publico, principal_id);
     expect(reclamo.status).toBe(201);
-    const { secreto_de_cliente, alcances } = (await reclamo.json()) as { secreto_de_cliente: string; alcances: string[] };
-    expect(secreto_de_cliente).toBeTruthy();
-    expect(alcances).toEqual(["read"]);
+    const cuerpo = (await reclamo.json()) as {
+      secreto_de_cliente: string;
+      secreto_de_refresco: string;
+      alcances: string[];
+      expira_en: string;
+      refresco_expira_en: string;
+    };
+    expect(cuerpo.secreto_de_cliente).toBeTruthy();
+    expect(cuerpo.secreto_de_refresco).toBeTruthy();
+    expect(cuerpo.secreto_de_cliente).not.toBe(cuerpo.secreto_de_refresco);
+    expect(cuerpo.alcances).toEqual(["read"]);
+    expect(new Date(cuerpo.refresco_expira_en).getTime()).toBeGreaterThan(new Date(cuerpo.expira_en).getTime());
   });
 
   it("un segundo reclamo del mismo cliente falla: ya no está pendiente", async () => {
@@ -139,6 +166,38 @@ describe("reclamo de credencial", () => {
 
     const reclamo = await reclamarCredencial(id_publico, principal_id, "no-es-el-principal-id");
     expect(reclamo.status).toBe(401);
+  });
+});
+
+describe("refresco de credencial", () => {
+  it("rechaza refrescar un cliente cuya credencial de acceso sigue vigente", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    await abrirEnlaceParaConectar(id_publico, secreto_de_enlace);
+    const autorizacion = await autorizarCliente(id_publico, secreto_de_enlace);
+    const { principal_id } = (await autorizacion.json()) as AutorizacionPendiente;
+    const reclamo = await reclamarCredencial(id_publico, principal_id);
+    const { secreto_de_refresco } = (await reclamo.json()) as { secreto_de_refresco: string };
+
+    // RefrescarCredencialDeCliente exige estado credencial_vencida:
+    // "autorizado" (recién reclamado, sin haber vencido) no basta.
+    const respuesta = await refrescarCredencial(id_publico, principal_id, secreto_de_refresco);
+    expect(respuesta.status).toBe(409);
+  });
+
+  it("rechaza refrescar un cliente pendiente (nunca reclamó su primera credencial)", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    await abrirEnlaceParaConectar(id_publico, secreto_de_enlace);
+    const autorizacion = await autorizarCliente(id_publico, secreto_de_enlace);
+    const { principal_id } = (await autorizacion.json()) as AutorizacionPendiente;
+
+    const respuesta = await refrescarCredencial(id_publico, principal_id, "cualquier-cosa");
+    expect(respuesta.status).toBe(409);
+  });
+
+  it("rechaza refrescar un cliente inexistente", async () => {
+    const { id_publico } = await emparejarInstalacion();
+    const respuesta = await refrescarCredencial(id_publico, "principal-inexistente", "cualquier-cosa");
+    expect(respuesta.status).toBe(404);
   });
 });
 
