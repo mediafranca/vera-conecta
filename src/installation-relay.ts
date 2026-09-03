@@ -1,9 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { hashWithPepper, randomToken, timingSafeEqualStrings, verifyWithPepper } from "./crypto";
+import { clasificarMetodo, origenAdmitido } from "./mcp";
 
 export interface Env {
   INSTALLATIONS: DurableObjectNamespace<InstallationRelay>;
   VERA_CONECTA_TOKEN_PEPPER: string;
+  // Lista separada por comas de orígenes admitidos para /mcp. Vacía por
+  // omisión: sin configurar, cualquier solicitud con Origin se rechaza y sólo
+  // pasan los clientes nativos que no envían esa cabecera.
+  VERA_CONECTA_ALLOWED_ORIGINS?: string;
 }
 
 // specs/installation-link.allium § config
@@ -26,8 +31,40 @@ type Alcance = (typeof ALCANCES_VALIDOS)[number];
 const EVIDENCIAS_VALIDAS = ["bearer_del_piloto", "confirmacion_en_desktop", "oauth_con_consentimiento_explicito"] as const;
 type Evidencia = (typeof EVIDENCIAS_VALIDAS)[number];
 
-function json(status: number, body: unknown): Response {
-  return Response.json(body, { status, headers: { "cache-control": "no-store" } });
+// specs/mcp-relay.allium § config
+const PLAZO_DE_SOLICITUD_MS = 120_000;
+const PLAZO_DE_ESCRITURA_MS = 15 * 60_000;
+const MAX_CONCURRENTES_POR_INSTALACION = 32;
+const MAX_CONCURRENTES_POR_CLIENTE = 8;
+const BYTES_MAXIMOS_POR_SOLICITUD = 10_485_760;
+const MAX_REINTENTOS_DE_LECTURA = 1;
+const BITS_ENTROPIA_REQUEST_ID = 128;
+
+// CodigoPublico -> HTTP, correspondencia uno a uno fijada por la spec.
+const HTTP_POR_CODIGO_PUBLICO = {
+  no_autenticada: 401,
+  sin_alcance: 403,
+  instalacion_desconocida: 404,
+  conflicto_de_enlace: 409,
+  excede_limite: 413,
+  cuota_agotada: 429,
+  escrituras_suspendidas: 503,
+  vera_offline: 503,
+  plazo_agotado: 504,
+} as const;
+type CodigoPublico = keyof typeof HTTP_POR_CODIGO_PUBLICO;
+
+function json(status: number, body: unknown, extraHeaders?: Record<string, string>): Response {
+  return Response.json(body, {
+    status,
+    headers: { "cache-control": "no-store", ...extraHeaders },
+  });
+}
+
+class McpRechazo extends Error {
+  constructor(public readonly codigo: CodigoPublico) {
+    super(codigo);
+  }
 }
 
 interface DesafioRow extends Record<string, SqlStorageValue> {
@@ -55,7 +92,41 @@ interface ClienteRow extends Record<string, SqlStorageValue> {
   refresco_expira_en: number | null;
 }
 
+type EstadoSolicitudMcp =
+  | "recibida"
+  | "autenticada"
+  | "entregada"
+  | "respondida"
+  | "rechazada"
+  | "vera_desconectada"
+  | "resultado_incierto";
+
+interface SolicitudMcpRow extends Record<string, SqlStorageValue> {
+  request_id: string;
+  cliente_principal_id: string | null;
+  sesion_id: string | null;
+  clase: "lectura" | "escritura";
+  estado: EstadoSolicitudMcp;
+  acusada: number;
+  reintentos: number;
+  entregada_por: string | null;
+}
+
+// Correlación en memoria de una solicitud MCP con su respuesta: el contenido
+// (method/params/resultado) nunca toca SQL — vive sólo mientras la solicitud
+// HTTP que la originó sigue esperando, tal como exige privacy-and-audit.allium.
+interface SolicitudEnVuelo {
+  method: string;
+  params: unknown;
+  jsonrpcId: unknown;
+  resolver: (respuesta: { resultado?: unknown; error?: unknown }) => void;
+  rechazar: (codigo: CodigoPublico) => void;
+  liquidada: boolean;
+}
+
 export class InstallationRelay extends DurableObject<Env> {
+  private readonly enVuelo = new Map<string, SolicitudEnVuelo>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ensureSchema();
@@ -113,6 +184,29 @@ export class InstallationRelay extends DurableObject<Env> {
       estado TEXT NOT NULL,
       retirada_en INTEGER
     )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS sesiones_mcp (
+      identificador TEXT PRIMARY KEY,
+      cliente_principal_id TEXT NOT NULL,
+      abierta_en INTEGER NOT NULL,
+      estado TEXT NOT NULL,
+      cerrada_en INTEGER
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS solicitudes_mcp (
+      request_id TEXT PRIMARY KEY,
+      cliente_principal_id TEXT,
+      sesion_id TEXT,
+      clase TEXT NOT NULL,
+      alcance_requerido TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      recibida_en INTEGER NOT NULL,
+      plazo_en INTEGER NOT NULL,
+      acusada INTEGER NOT NULL DEFAULT 0,
+      reintentos INTEGER NOT NULL DEFAULT 0,
+      estado TEXT NOT NULL,
+      entregada_por TEXT,
+      respondida_en INTEGER,
+      codigo TEXT
+    )`);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -155,6 +249,15 @@ export class InstallationRelay extends DurableObject<Env> {
     const revokeClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/revoke$/);
     if (request.method === "POST" && revokeClienteMatch) {
       return this.revocarCliente(request, revokeClienteMatch[1]);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/mcp") {
+      return this.manejarSolicitudMcp(request);
+    }
+    if (request.method === "DELETE" && url.pathname === "/internal/mcp") {
+      return this.cerrarSesionMcp(request);
+    }
+    if (request.method === "GET" && url.pathname === "/internal/mcp") {
+      return json(501, { error: "streaming_sse_no_implementado" });
     }
     return json(404, { error: "ruta_interna_desconocida" });
   }
