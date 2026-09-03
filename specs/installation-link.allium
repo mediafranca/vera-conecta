@@ -1,0 +1,569 @@
+-- allium: 3
+--
+-- Vera Conecta — enlace de instalación
+--
+-- Qué garantiza esta spec: que una instalación de Vera Desktop obtiene una
+-- identidad durable en el relay, que exactamente un Desktop legítimo queda
+-- disponible para ese identificador, y que rotar o revocar corta el acceso
+-- anterior de forma explícita.
+--
+-- Incluye:
+--   - emparejamiento de una instalación (desafío breve, de un solo uso);
+--   - identificador público opaco y su regeneración;
+--   - secreto de enlace, rotación con ventana de solapamiento e invalidación;
+--   - apertura, desplazamiento y caída del canal saliente Desktop -> relay;
+--   - detección de caída por latido y estados visibles de conexión;
+--   - revocación de la instalación;
+--   - compuerta de versión de protocolo del conector.
+--
+-- Excluye:
+--   - autorización de clientes MCP y alcances (ver client-grants.allium);
+--   - transporte de solicitudes MCP (ver mcp-relay.allium);
+--   - retención y borrado del estado de control (ver privacy-and-audit.allium);
+--   - degradación, cuotas y despliegue (ver service-operations.allium);
+--   - el grafo de Vera, que vive íntegramente en Vera local.
+--
+-- Depende de:
+--   - Vera Desktop, que custodia el secreto de enlace en el almacén seguro del
+--     sistema operativo; esa custodia es frontera, no está especificada aquí;
+--   - un proveedor de identidad para la persona propietaria, todavía sin
+--     decidir (ver preguntas abiertas).
+--
+-- Nota de modelado: el estado "no_registrada" del diagrama de dominio no es un
+-- estado de la entidad sino la ausencia de la entidad: antes del reclamo del
+-- desafío no existe instalación alguna en el relay.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract CanalSaliente {
+    -- Obligación del conector de Vera Desktop sobre el canal de enlace.
+    -- El latido devuelve el instante observado: es una señal de vida sin
+    -- contenido alguno.
+    abrir: (id_publico: String, prueba_de_secreto: String, version_ofrecida: Integer) -> Timestamp
+    latir: (identificador_efimero: String) -> Timestamp
+
+    @invariant ConexionSiempreSaliente
+        -- El conector siempre inicia la conexión hacia el relay. El relay
+        -- nunca abre un puerto ni una conexión hacia el equipo doméstico.
+
+    @invariant SecretoNuncaViajaEnClaro
+        -- El conector demuestra posesión del secreto de enlace; no lo envía
+        -- como valor recuperable ni lo reutiliza para el endpoint MCP.
+
+    @guidance
+        -- La reconexión usa backoff con jitter. Un reintento inmediato y
+        -- sostenido tras un desplazamiento produce una guerra de conexiones
+        -- entre dos procesos Desktop del mismo equipo.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity Instalacion {
+    -- Identidad durable de una Vera Desktop dentro del relay.
+    id_publico: String
+    estado: emparejando | conectada | desconectada | revocada
+    creada_en: Timestamp
+    id_publico_rotado_en: Timestamp?
+    revocada_en: Timestamp when estado = revocada
+
+    -- Relaciones
+    secretos: SecretoDeEnlace with instalacion = this
+    conexiones: ConexionDeEnlace with instalacion = this
+    conexion_activa: ConexionDeEnlace with instalacion = this and estado = activa
+
+    -- Proyecciones
+    secretos_vigentes: secretos where estado = vigente
+    secretos_solapados: secretos where estado = solapado
+    secretos_utilizables: secretos where estado in {vigente, solapado}
+    conexiones_activas: conexiones where estado = activa
+
+    -- Derivados
+    esta_disponible: estado = conectada and conexiones_activas.count = 1
+
+    transitions estado {
+        emparejando -> conectada
+        emparejando -> revocada
+        conectada -> desconectada
+        desconectada -> conectada
+        conectada -> revocada
+        desconectada -> revocada
+        terminal: revocada
+    }
+
+    invariant UnaSolaConexionActiva {
+        -- Una conexión Desktop activa a la vez por instalación.
+        conexiones_activas.count <= 1
+    }
+
+    invariant RevocadaNoConservaSecretosUtilizables {
+        estado = revocada implies secretos_utilizables.count = 0
+    }
+}
+
+entity DesafioDeEmparejamiento {
+    -- Desafío breve, de un solo uso, que precede a la identidad durable.
+    hash_del_codigo: String
+    estado: pendiente | reclamado | caducado
+    emitido_en: Timestamp
+    expira_en: Timestamp
+    version_ofrecida: Integer
+    instalacion: Instalacion when estado = reclamado
+
+    esta_expirado: expira_en <= now
+
+    transitions estado {
+        pendiente -> reclamado
+        pendiente -> caducado
+        terminal: reclamado, caducado
+    }
+}
+
+entity SecretoDeEnlace {
+    -- Autentica sólo el canal Desktop <-> relay. No sirve para MCP.
+    instalacion: Instalacion
+    hash: String
+    emitido_en: Timestamp
+    estado: vigente | solapado | invalidado
+    solapamiento_expira_en: Timestamp when estado = solapado
+
+    transitions estado {
+        vigente -> solapado
+        vigente -> invalidado
+        solapado -> invalidado
+        terminal: invalidado
+    }
+}
+
+entity ConexionDeEnlace {
+    -- Una sesión del canal saliente. Es efímera: no sobrevive al proceso.
+    instalacion: Instalacion
+    identificador_efimero: String
+    version_negociada: Integer
+    abierta_en: Timestamp
+    ultimo_latido_en: Timestamp
+    estado: activa | desplazada | cerrada
+    cerrada_en: Timestamp when estado = desplazada | cerrada
+
+    transitions estado {
+        activa -> desplazada
+        activa -> cerrada
+        terminal: desplazada, cerrada
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Valores iniciales del piloto. Las duraciones siguen abiertas (ver
+    -- preguntas abiertas): están aquí para que ninguna regla las esconda.
+    vigencia_del_desafio: Duration = 10.minutes
+    solapamiento_de_rotacion: Duration = 5.minutes
+    umbral_de_latido: Duration = 60.seconds
+    bits_de_entropia_id_publico: Integer = 128
+    bits_de_entropia_secreto: Integer = 256
+    version_minima_admitida: Integer = 1
+    version_maxima_admitida: Integer = 1
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Emparejar --------------------------------------------------------------
+
+rule EmitirDesafioDeEmparejamiento {
+    when: DesktopSolicitaEmparejamiento(version_ofrecida)
+    ensures: DesafioDeEmparejamiento.created(
+        hash_del_codigo: hash(codigo_de_un_solo_uso(config.bits_de_entropia_secreto)),
+        estado: pendiente,
+        emitido_en: now,
+        expira_en: now + config.vigencia_del_desafio,
+        version_ofrecida: version_ofrecida
+    )
+
+    @guidance
+        -- El código se muestra una vez a Vera Desktop y sólo se conserva su
+        -- hash. Este endpoint no tiene identidad previa, así que debe estar
+        -- protegido contra abuso por volumen, no por credencial.
+}
+
+rule ReclamarEmparejamiento {
+    when: DesktopReclamaDesafio(desafio, codigo)
+    requires: desafio.estado = pendiente
+    requires: not desafio.esta_expirado
+    requires: verifica(codigo, desafio.hash_del_codigo)
+    ensures:
+        let instalacion = Instalacion.created(
+            id_publico: identificador_opaco(config.bits_de_entropia_id_publico),
+            estado: emparejando,
+            creada_en: now
+        )
+        desafio.estado = reclamado
+        desafio.instalacion = instalacion
+        SecretoDeEnlace.created(
+            instalacion: instalacion,
+            hash: hash(secreto_nuevo(config.bits_de_entropia_secreto)),
+            emitido_en: now,
+            estado: vigente
+        )
+        EmparejamientoCompletado(
+            instalacion: instalacion,
+            version_ofrecida: desafio.version_ofrecida
+        )
+}
+
+rule DesafioDeEmparejamientoCaduca {
+    when: desafio: DesafioDeEmparejamiento.expira_en <= now
+    requires: desafio.estado = pendiente
+    ensures: desafio.estado = caducado
+}
+
+rule EmparejamientoNoCompletadoSeRevoca {
+    -- Una instalación emparejada que nunca abrió su canal no queda viva
+    -- indefinidamente: sin canal no hay nada que servir.
+    when: instalacion: Instalacion.creada_en + config.vigencia_del_desafio <= now
+    requires: instalacion.estado = emparejando
+    ensures:
+        instalacion.estado = revocada
+        instalacion.revocada_en = now
+        for s in instalacion.secretos_vigentes:
+            s.estado = invalidado
+        InstalacionRevocada(instalacion: instalacion, motivo: emparejamiento_abandonado)
+}
+
+-- Conectar ---------------------------------------------------------------
+
+rule AbrirCanalDeEnlace {
+    when: DesktopAbreCanal(instalacion, prueba_de_secreto, version_ofrecida, identificador_efimero)
+    requires: version_ofrecida >= config.version_minima_admitida
+    requires: version_ofrecida <= config.version_maxima_admitida
+    requires: instalacion.secretos_utilizables.any(s => verifica(prueba_de_secreto, s.hash))
+    requires: instalacion.estado in {emparejando, desconectada}
+    ensures:
+        instalacion.estado = conectada
+        ConexionDeEnlace.created(
+            instalacion: instalacion,
+            identificador_efimero: identificador_efimero,
+            version_negociada: version_ofrecida,
+            abierta_en: now,
+            ultimo_latido_en: now,
+            estado: activa
+        )
+        VeraConectada(instalacion: instalacion, version_negociada: version_ofrecida)
+}
+
+rule ConexionNuevaDesplazaAnterior {
+    -- Si dos procesos presentan el mismo enlace, la conexión nueva desplaza a
+    -- la anterior y queda constancia operativa.
+    when: DesktopAbreCanal(instalacion, prueba_de_secreto, version_ofrecida, identificador_efimero)
+    requires: version_ofrecida >= config.version_minima_admitida
+    requires: version_ofrecida <= config.version_maxima_admitida
+    requires: instalacion.secretos_utilizables.any(s => verifica(prueba_de_secreto, s.hash))
+    requires: instalacion.estado = conectada
+    ensures:
+        for c in instalacion.conexiones_activas:
+            c.estado = desplazada
+            c.cerrada_en = now
+        ConexionDeEnlace.created(
+            instalacion: instalacion,
+            identificador_efimero: identificador_efimero,
+            version_negociada: version_ofrecida,
+            abierta_en: now,
+            ultimo_latido_en: now,
+            estado: activa
+        )
+        EnlaceDesplazado(instalacion: instalacion, identificador_efimero: identificador_efimero)
+}
+
+rule RechazarCanalPorCredencial {
+    -- Una instalación inexistente y una revocada son indistinguibles desde
+    -- fuera: ambas fallan aquí, con el mismo motivo y sin más detalle.
+    when: DesktopAbreCanal(instalacion, prueba_de_secreto, version_ofrecida, identificador_efimero)
+    requires: version_ofrecida >= config.version_minima_admitida
+    requires: version_ofrecida <= config.version_maxima_admitida
+    requires: not instalacion.secretos_utilizables.any(s => verifica(prueba_de_secreto, s.hash))
+    ensures: EnlaceRechazado(
+        instalacion: instalacion,
+        motivo: credencial_de_enlace_invalida,
+        identificador_efimero: identificador_efimero
+    )
+}
+
+rule RechazarCanalPorVersion {
+    -- Rechazo explícito de versión: nunca un fallo silencioso ni un cierre
+    -- sin motivo, para que el conector antiguo sepa que debe actualizarse.
+    when: DesktopAbreCanal(instalacion, prueba_de_secreto, version_ofrecida, identificador_efimero)
+    requires:
+        version_ofrecida < config.version_minima_admitida
+        or version_ofrecida > config.version_maxima_admitida
+    ensures: EnlaceRechazado(
+        instalacion: instalacion,
+        motivo: version_de_protocolo_incompatible,
+        identificador_efimero: identificador_efimero
+    )
+}
+
+rule RegistrarLatido {
+    when: DesktopEnviaLatido(conexion)
+    requires: conexion.estado = activa
+    ensures: conexion.ultimo_latido_en = now
+}
+
+-- Desconectar ------------------------------------------------------------
+
+rule CanalDeEnlaceSeCierra {
+    when: CanalSeCierra(conexion)
+    requires: conexion.estado = activa
+    requires: conexion.instalacion.estado = conectada
+    ensures:
+        conexion.estado = cerrada
+        conexion.cerrada_en = now
+        conexion.instalacion.estado = desconectada
+        VeraDesconectada(instalacion: conexion.instalacion, motivo: canal_cerrado)
+}
+
+rule CaidaDeConexionDetectadaPorSilencio {
+    when: conexion: ConexionDeEnlace.ultimo_latido_en + config.umbral_de_latido <= now
+    requires: conexion.estado = activa
+    requires: conexion.instalacion.estado = conectada
+    ensures:
+        conexion.estado = cerrada
+        conexion.cerrada_en = now
+        conexion.instalacion.estado = desconectada
+        VeraDesconectada(instalacion: conexion.instalacion, motivo: silencio_del_canal)
+}
+
+-- Rotar y regenerar ------------------------------------------------------
+
+rule RotarSecretoDeEnlace {
+    when: DesktopSolicitaRotacionDeSecreto(instalacion)
+    requires: instalacion.estado in {conectada, desconectada}
+    requires: instalacion.secretos_vigentes.count > 0
+    ensures:
+        for s in instalacion.secretos_vigentes:
+            s.estado = solapado
+            s.solapamiento_expira_en = now + config.solapamiento_de_rotacion
+        SecretoDeEnlace.created(
+            instalacion: instalacion,
+            hash: hash(secreto_nuevo(config.bits_de_entropia_secreto)),
+            emitido_en: now,
+            estado: vigente
+        )
+}
+
+rule DesktopConfirmaRotacion {
+    -- La confirmación de Desktop cierra la ventana antes de tiempo.
+    when: DesktopConfirmaRotacionDeSecreto(instalacion)
+    requires: instalacion.secretos_solapados.count > 0
+    ensures:
+        for s in instalacion.secretos_solapados:
+            s.estado = invalidado
+            s.solapamiento_expira_en = null
+}
+
+rule SolapamientoDeRotacionExpira {
+    when: secreto: SecretoDeEnlace.solapamiento_expira_en <= now
+    requires: secreto.estado = solapado
+    ensures:
+        secreto.estado = invalidado
+        secreto.solapamiento_expira_en = null
+}
+
+rule RegenerarIdPublicoConCanalAbierto {
+    -- Regenerar el ID público corta todas las URL anteriores, incluida la del
+    -- propio canal: Desktop debe volver a conectar con el identificador nuevo.
+    when: DesktopRegeneraIdPublico(instalacion)
+    requires: instalacion.estado = conectada
+    ensures:
+        instalacion.id_publico = identificador_opaco(config.bits_de_entropia_id_publico)
+        instalacion.id_publico_rotado_en = now
+        for c in instalacion.conexiones_activas:
+            c.estado = cerrada
+            c.cerrada_en = now
+        instalacion.estado = desconectada
+        IdPublicoRegenerado(instalacion: instalacion)
+}
+
+rule RegenerarIdPublicoSinCanal {
+    when: DesktopRegeneraIdPublico(instalacion)
+    requires: instalacion.estado = desconectada
+    ensures:
+        instalacion.id_publico = identificador_opaco(config.bits_de_entropia_id_publico)
+        instalacion.id_publico_rotado_en = now
+        IdPublicoRegenerado(instalacion: instalacion)
+}
+
+-- Revocar ----------------------------------------------------------------
+
+rule RevocarInstalacion {
+    when: DesktopRevocaInstalacion(instalacion)
+    requires: instalacion.estado in {emparejando, conectada, desconectada}
+    ensures:
+        instalacion.estado = revocada
+        instalacion.revocada_en = now
+        for s in instalacion.secretos_vigentes:
+            s.estado = invalidado
+        for s in instalacion.secretos_solapados:
+            s.estado = invalidado
+            s.solapamiento_expira_en = null
+        for c in instalacion.conexiones_activas:
+            c.estado = cerrada
+            c.cerrada_en = now
+        InstalacionRevocada(instalacion: instalacion, motivo: revocacion_de_la_persona)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ConectadaImplicaCanalAbierto {
+    -- "Apagado significa cerrado": el estado conectada no se declara sin un
+    -- canal saliente vivo detrás.
+    for i in Instalaciones:
+        i.estado = conectada implies i.conexiones_activas.count = 1
+}
+
+invariant IdPublicoNoEsUnaCredencial {
+    -- Ningún secreto se deriva del identificador público: un ID conocido no
+    -- produce por sí solo un secreto de enlace utilizable.
+    for s in SecretosDeEnlace:
+        s.estado in {vigente, solapado} implies s.hash != s.instalacion.id_publico
+}
+
+invariant DesafioDeUnSoloUso {
+    -- Un desafío reclamado queda ligado a exactamente una instalación.
+    for d in DesafiosDeEmparejamiento:
+        d.estado = reclamado implies d.instalacion != null
+}
+
+invariant ConexionActivaSoloEnInstalacionConectada {
+    -- No existe canal vivo sobre una instalación que se declara desconectada
+    -- o revocada.
+    for c in ConexionesDeEnlace:
+        c.estado = activa implies c.instalacion.estado = conectada
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ConectorDesktop {
+    -- Desde el relay, el conector se identifica por la instalación cuyo
+    -- secreto de enlace demuestra poseer.
+    identified_by: Instalacion where estado in {emparejando, conectada, desconectada}
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface SolicitudDeEmparejamiento {
+    -- Única superficie sin identidad previa del sistema.
+    provides:
+        DesktopSolicitaEmparejamiento(version_ofrecida)
+
+    @guarantee SinIdentidadPrevia
+        -- Esta superficie no autentica a nadie y no revela ningún estado
+        -- existente: su única salida es un desafío nuevo.
+
+    @guidance
+        -- Corresponde a la creación de un emparejamiento. Debe limitarse por
+        -- volumen y origen, nunca por conocimiento de un ID público.
+}
+
+surface ReclamoDeEmparejamiento {
+    context desafio: DesafioDeEmparejamiento where estado = pendiente
+
+    exposes:
+        desafio.expira_en
+        desafio.esta_expirado
+
+    provides:
+        DesktopReclamaDesafio(desafio, codigo) when not desafio.esta_expirado
+
+    @guarantee UnSoloReclamo
+        -- Un desafío se reclama a lo sumo una vez. Un segundo reclamo con el
+        -- mismo código no produce una segunda instalación.
+
+    timeout:
+        DesafioDeEmparejamientoCaduca
+}
+
+surface CanalDeEnlace {
+    facing conector: ConectorDesktop
+
+    exposes:
+        conector.id_publico
+        conector.estado
+        conector.esta_disponible
+
+    provides:
+        DesktopAbreCanal(conector, prueba_de_secreto, version_ofrecida, identificador_efimero)
+        DesktopEnviaLatido(conector.conexion_activa) when conector.estado = conectada
+        CanalSeCierra(conector.conexion_activa) when conector.estado = conectada
+        DesktopSolicitaRotacionDeSecreto(conector)
+        DesktopConfirmaRotacionDeSecreto(conector)
+
+    contracts:
+        demands CanalSaliente
+
+    @guarantee IdPublicoUbicaPeroNoAutoriza
+        -- Conocer el identificador público permite dirigir una conexión a
+        -- esta instalación, nunca abrirla. La apertura exige prueba del
+        -- secreto de enlace.
+
+    @guarantee RechazoIndistinguible
+        -- Un identificador inexistente y uno revocado producen el mismo
+        -- rechazo, sin revelar cuál de los dos casos ocurrió.
+
+    timeout:
+        CaidaDeConexionDetectadaPorSilencio
+}
+
+surface ControlDeInstalacion {
+    -- Lo que la persona propietaria ve y decide sobre su instalación. En el
+    -- piloto lo presenta Vera Desktop, que es el principal autenticado del
+    -- canal de control frente al relay.
+    facing conector: ConectorDesktop
+
+    exposes:
+        conector.id_publico
+        conector.estado
+        conector.esta_disponible
+        conector.creada_en
+        conector.id_publico_rotado_en
+
+    provides:
+        DesktopRegeneraIdPublico(conector)
+        DesktopRevocaInstalacion(conector)
+
+    @guarantee EstadoLegibleSinJerga
+        -- El estado se presenta como "Vera conectada", "Vera desconectada" o
+        -- "acceso revocado". Un error de red genérico no es un estado válido
+        -- para una persona no técnica.
+
+    @guidance
+        -- Regenerar el identificador público es una operación destructiva
+        -- para las URL en circulación; la interfaz debe decirlo antes, no
+        -- después.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "¿Cuánto dura realmente el código de emparejamiento y la ventana de solapamiento de rotación? Los valores de config son provisionales del piloto."
+
+open question "¿Se permite más de una conexión Desktop simultánea por instalación? El modelo actual desplaza la conexión anterior; hace falta confirmar que ese es el comportamiento querido y no una limitación aceptada por comodidad."
+
+open question "¿Qué significa recuperar una instalación después de reinstalar el sistema operativo o perder el almacén de secretos? Hoy sólo existe emparejar de nuevo, lo que produce una instalación distinta y rompe las URL en circulación."
+
+open question "¿Regenerar el identificador público conserva las autorizaciones de cliente o las revoca? Esta spec sólo corta el canal; la decisión afecta directamente a client-grants.allium."
+
+open question "¿Existe una identidad de persona propietaria en el relay, o Vera Desktop es el único principal autenticado del canal de control? De ello depende si puede haber control cuando Desktop está apagada."

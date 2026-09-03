@@ -1,0 +1,423 @@
+-- allium: 3
+--
+-- Vera Conecta — autorización de clientes MCP
+--
+-- Qué garantiza esta spec: que cada aplicación remota tiene su propia
+-- identidad y sus propios alcances frente a una instalación, que la persona
+-- propietaria puede retirarlos en cualquier momento, y que retirar uno no
+-- toca a los demás.
+--
+-- Incluye:
+--   - alta de un cliente autorizado por instalación;
+--   - concesión de alcances y evidencia de consentimiento;
+--   - emisión de la credencial del cliente y su expiración;
+--   - revocación por cliente y revocación en cascada al revocar la instalación;
+--   - obligación de traducción de alcance remoto a permiso Vera local.
+--
+-- Excluye:
+--   - emparejamiento y canal de enlace (ver installation-link.allium);
+--   - comprobación de alcance por solicitud (ver mcp-relay.allium);
+--   - retención y borrado de este estado (ver privacy-and-audit.allium);
+--   - el flujo OAuth 2.1 en sí, que es una integración estándar y debería
+--     vivir en una spec de biblioteca aparte cuando se decida el proveedor.
+--
+-- Depende de:
+--   - installation-link.allium para la identidad de la instalación;
+--   - Vera local, que es la autoridad final de permisos: los alcances de esta
+--     spec son un techo, nunca una concesión efectiva;
+--   - un proveedor de identidad y consentimiento todavía sin decidir.
+
+use "./installation-link.allium" as enlace
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Persona {
+    -- La persona propietaria. Su identidad la administra un proveedor todavía
+    -- sin decidir; el relay sólo recibiría una referencia opaca.
+    referencia_opaca: String
+}
+
+external entity CredencialVeraLocal {
+    -- Vive en Vera Desktop y nunca llega al relay. Aparece aquí sólo como
+    -- frontera: es lo que el conector selecciona para atribuir una operación.
+    referencia_local: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract TraduccionDeAlcance {
+    -- Obligación del conector de Vera Desktop al convertir una identidad
+    -- remota en una credencial Vera local.
+    credencial_para: (principal_id: String, alcances: Set<Alcance>) -> CredencialVeraLocal
+
+    @invariant AlcanceNoSeAmplia
+        -- La credencial Vera local resultante tiene alcance igual o menor al
+        -- concedido en el relay. Nunca mayor, ni siquiera si Vera local
+        -- dispone de una credencial más amplia para la misma persona.
+
+    @invariant CredencialNoPropuestaPorElPayload
+        -- La asociación remoto -> credencial local vive en Desktop. Ningún
+        -- campo de la solicitud puede elegir participante ni credencial.
+
+    @guidance
+        -- Si no existe una credencial local de alcance suficientemente
+        -- estrecho, la respuesta correcta es negar la operación, no promover
+        -- la identidad remota a una credencial más amplia.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Alcance {
+    -- Alcances de producto del piloto. La lista está deliberadamente corta;
+    -- ver preguntas abiertas.
+    read | write
+}
+
+enum EvidenciaDeConsentimiento {
+    bearer_del_piloto
+    | confirmacion_en_desktop
+    | oauth_con_consentimiento_explicito
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ClienteAutorizado {
+    -- Una identidad por aplicación o dispositivo remoto. Revocar Claude no
+    -- desconecta ChatGPT porque son dos instancias distintas de esta entidad.
+    instalacion: enlace/Instalacion
+    principal_id: String
+    etiqueta_de_aplicacion: String
+    estado: pendiente | autorizado | revocado | expirado
+    creado_en: Timestamp
+    expira_en: Timestamp when estado = pendiente | autorizado
+    hash_de_credencial: String when estado = autorizado
+    revocado_en: Timestamp when estado = revocado
+
+    concesion: Concesion with cliente = this
+
+    transitions estado {
+        pendiente -> autorizado
+        pendiente -> revocado
+        pendiente -> expirado
+        autorizado -> revocado
+        autorizado -> expirado
+        terminal: revocado, expirado
+    }
+}
+
+entity Concesion {
+    -- Alcances y vigencia otorgados a un cliente.
+    cliente: ClienteAutorizado
+    alcances: Set<Alcance>
+    otorgada_en: Timestamp
+    otorgada_por: Persona?
+    evidencia: EvidenciaDeConsentimiento
+    estado: vigente | retirada
+    retirada_en: Timestamp when estado = retirada
+
+    permite(a): a in alcances
+
+    transitions estado {
+        vigente -> retirada
+        terminal: retirada
+    }
+
+    invariant ConcesionVigenteConAlcances {
+        -- Una concesión vigente sin alcances autorizaría sin conceder nada.
+        estado = vigente implies alcances.count > 0
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    vigencia_de_autorizacion_pendiente: Duration = 15.minutes
+    vigencia_de_credencial: Duration = 30.days
+    bits_de_entropia_credencial: Integer = 256
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Autorizar --------------------------------------------------------------
+
+rule AutorizarCliente {
+    when: DesktopAutorizaCliente(instalacion, etiqueta_de_aplicacion, alcances, evidencia)
+    requires: instalacion.estado in {conectada, desconectada}
+    requires: alcances.count > 0
+    ensures:
+        let cliente = ClienteAutorizado.created(
+            instalacion: instalacion,
+            principal_id: identificador_opaco(config.bits_de_entropia_credencial),
+            etiqueta_de_aplicacion: etiqueta_de_aplicacion,
+            estado: pendiente,
+            creado_en: now,
+            expira_en: now + config.vigencia_de_autorizacion_pendiente
+        )
+        Concesion.created(
+            cliente: cliente,
+            alcances: alcances,
+            otorgada_en: now,
+            evidencia: evidencia,
+            estado: vigente
+        )
+        ClienteAutorizadoCreado(instalacion: instalacion, cliente: cliente)
+}
+
+rule EmitirCredencialDeCliente {
+    when: ClienteReclamaCredencial(cliente, prueba_de_consentimiento)
+    requires: cliente.estado = pendiente
+    requires: cliente.expira_en > now
+    requires: verifica(prueba_de_consentimiento, cliente.principal_id)
+    ensures:
+        cliente.estado = autorizado
+        cliente.hash_de_credencial = hash(secreto_nuevo(config.bits_de_entropia_credencial))
+        cliente.expira_en = now + config.vigencia_de_credencial
+        CredencialDeClienteEmitida(cliente: cliente)
+
+    @guidance
+        -- La credencial se muestra una vez y sólo se conserva su hash con
+        -- pepper operacional. El relay no puede reconstruirla ni mostrarla de
+        -- nuevo: si se pierde, se autoriza otro cliente.
+}
+
+-- Expirar ----------------------------------------------------------------
+
+rule AutorizacionPendienteCaduca {
+    when: cliente: ClienteAutorizado.expira_en <= now
+    requires: cliente.estado = pendiente
+    ensures:
+        cliente.estado = expirado
+        cliente.expira_en = null
+        cliente.concesion.estado = retirada
+        cliente.concesion.retirada_en = now
+}
+
+rule CredencialDeClienteExpira {
+    when: cliente: ClienteAutorizado.expira_en <= now
+    requires: cliente.estado = autorizado
+    ensures:
+        cliente.estado = expirado
+        cliente.expira_en = null
+        cliente.hash_de_credencial = null
+        cliente.concesion.estado = retirada
+        cliente.concesion.retirada_en = now
+        AccesoDeClienteTerminado(cliente: cliente, motivo: expiracion)
+}
+
+-- Revocar ----------------------------------------------------------------
+
+rule RevocarClientePendiente {
+    when: DesktopRevocaCliente(cliente)
+    requires: cliente.estado = pendiente
+    ensures:
+        cliente.estado = revocado
+        cliente.revocado_en = now
+        cliente.expira_en = null
+        cliente.concesion.estado = retirada
+        cliente.concesion.retirada_en = now
+        AccesoDeClienteTerminado(cliente: cliente, motivo: revocacion_de_la_persona)
+}
+
+rule RevocarClienteAutorizado {
+    when: DesktopRevocaCliente(cliente)
+    requires: cliente.estado = autorizado
+    ensures:
+        cliente.estado = revocado
+        cliente.revocado_en = now
+        cliente.expira_en = null
+        cliente.hash_de_credencial = null
+        cliente.concesion.estado = retirada
+        cliente.concesion.retirada_en = now
+        AccesoDeClienteTerminado(cliente: cliente, motivo: revocacion_de_la_persona)
+
+    @guidance
+        -- Revocar es una operación de control, no de limpieza diferida: desde
+        -- este instante la credencial deja de autenticar aunque el cliente la
+        -- siga presentando y aunque Desktop esté desconectada.
+}
+
+rule RevocarClientesPendientesAlRevocarInstalacion {
+    when: enlace/InstalacionRevocada(inst, motivo)
+    for cliente in ClientesAutorizados where estado = pendiente:
+        requires: cliente.instalacion = inst
+        requires: cliente.estado = pendiente
+        ensures:
+            cliente.estado = revocado
+            cliente.revocado_en = now
+            cliente.expira_en = null
+            cliente.concesion.estado = retirada
+            cliente.concesion.retirada_en = now
+}
+
+rule RevocarClientesAutorizadosAlRevocarInstalacion {
+    when: enlace/InstalacionRevocada(inst, motivo)
+    for cliente in ClientesAutorizados where estado = autorizado:
+        requires: cliente.instalacion = inst
+        requires: cliente.estado = autorizado
+        ensures:
+            cliente.estado = revocado
+            cliente.revocado_en = now
+            cliente.expira_en = null
+            cliente.hash_de_credencial = null
+            cliente.concesion.estado = retirada
+            cliente.concesion.retirada_en = now
+            AccesoDeClienteTerminado(cliente: cliente, motivo: instalacion_revocada)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ConcesionSigueAlCliente {
+    -- Un cliente que ya no accede no conserva una concesión vigente.
+    for c in Concesiones:
+        c.cliente.estado in {revocado, expirado} implies c.estado = retirada
+}
+
+invariant ConcesionUnicaPorCliente {
+    -- Un cliente tiene una concesión y no una acumulación de alcances
+    -- concedidos en momentos distintos.
+    for a in Concesiones:
+        for b in Concesiones:
+            a != b implies a.cliente != b.cliente
+}
+
+invariant CredencialSoloMientrasAutoriza {
+    -- Sólo un cliente autorizado tiene un hash de credencial almacenado.
+    for c in ClientesAutorizados:
+        c.estado = autorizado implies c.hash_de_credencial != null
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ConectorDesktop {
+    identified_by: enlace/Instalacion where estado in {conectada, desconectada}
+}
+
+actor ClienteMcp {
+    identified_by: ClienteAutorizado where estado in {pendiente, autorizado}
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ConsentimientoYClientes {
+    -- Lo que la persona propietaria decide sobre quién accede a su Vera. En
+    -- el piloto lo presenta Vera Desktop.
+    facing conector: ConectorDesktop
+
+    let clientes = ClientesAutorizados where instalacion = conector
+
+    exposes:
+        for cliente in clientes:
+            cliente.etiqueta_de_aplicacion
+            cliente.estado
+            cliente.creado_en
+            cliente.concesion.alcances
+            cliente.concesion.evidencia
+
+    provides:
+        DesktopAutorizaCliente(conector, etiqueta_de_aplicacion, alcances, evidencia)
+
+    related:
+        for cliente in clientes:
+            ControlDeClienteAutorizado(cliente)
+
+    @guarantee RevocarUnoNoAfectaAOtros
+        -- Retirar el acceso de una aplicación no interrumpe el enlace de la
+        -- instalación ni el acceso de las demás aplicaciones autorizadas.
+
+    @guarantee LaCredencialNoSeMuestraDosVeces
+        -- Esta superficie nunca expone la credencial de un cliente ya
+        -- emitido, sólo su estado y sus alcances.
+}
+
+surface ControlDeClienteAutorizado {
+    -- Una aplicación concreta, vista desde el control de la persona.
+    context cliente: ClienteAutorizado where estado in {pendiente, autorizado}
+
+    exposes:
+        cliente.etiqueta_de_aplicacion
+        cliente.estado
+        cliente.expira_en
+        cliente.concesion.alcances
+        cliente.concesion.evidencia
+
+    provides:
+        DesktopRevocaCliente(cliente)
+
+    @guarantee RevocacionInmediata
+        -- Tras revocar, ninguna solicitud nueva de ese cliente se autentica,
+        -- aunque presente una credencial que todavía no ha expirado.
+
+    timeout:
+        CredencialDeClienteExpira
+}
+
+surface ReclamoDeCredencial {
+    facing cliente: ClienteMcp
+
+    exposes:
+        cliente.etiqueta_de_aplicacion
+        cliente.concesion.alcances
+        cliente.estado
+
+    provides:
+        ClienteReclamaCredencial(cliente, prueba_de_consentimiento)
+            when cliente.estado = pendiente
+
+    @guarantee ConsentimientoAntesQueCredencial
+        -- No se emite credencial sin evidencia de consentimiento registrada
+        -- en la concesión.
+
+    timeout:
+        AutorizacionPendienteCaduca
+}
+
+surface TraduccionDeIdentidadRemota {
+    -- Frontera con Vera local: el relay entrega una identidad derivada y el
+    -- conector decide con qué credencial Vera opera.
+    facing conector: ConectorDesktop
+
+    exposes:
+        conector.id_publico
+        CredencialVeraLocal
+
+    contracts:
+        demands TraduccionDeAlcance
+
+    @guarantee AutoridadFinalEnVera
+        -- Los alcances de esta spec son un techo. Vera local puede conceder
+        -- menos; jamás más.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "¿Qué alcances de producto existen además de read y write? El enum Alcance está fijado en dos valores sólo porque nadie ha nombrado un tercero."
+
+open question "¿El primer piloto admite escritura o empieza estrictamente en lectura? El plan de implementación sugiere lectura en M2 y escritura gobernada en M3, pero el producto no lo ha declarado."
+
+open question "¿Quién inicia y revoca autorizaciones si Vera Desktop está offline? Hoy todas las reglas de control entran por el conector; sin canal no hay forma de revocar desde el relay."
+
+open question "¿Cuánto duran la autorización pendiente, el access token y el refresh token? Los valores de config son provisionales y no hay modelo de refresh."
+
+open question "¿Cómo se prueba el consentimiento cuando el cliente no ofrece OAuth dinámico? La evidencia bearer_del_piloto documenta el hueco, no lo resuelve."
+
+open question "¿Es admisible persistir una etiqueta de aplicación elegida por la persona? No figura entre las clases de dato permitidas en privacy-and-audit.allium; o se clasifica como estado de control o se sustituye por un identificador opaco."

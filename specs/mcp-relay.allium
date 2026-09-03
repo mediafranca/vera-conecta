@@ -1,0 +1,620 @@
+-- allium: 3
+--
+-- Vera Conecta — relay MCP
+--
+-- Qué garantiza esta spec: que una solicitud MCP autenticada llega a la Vera
+-- correcta una sola vez, o termina con un resultado explícito. Nunca queda
+-- encolada, nunca cruza de instalación y nunca se confirma una escritura cuyo
+-- resultado el relay no conoce.
+--
+-- Incluye:
+--   - aceptación de una solicitud MCP y su rechazo con motivo de dominio;
+--   - sesión MCP como continuidad de transporte;
+--   - entrega por el canal de enlace y acuse de recibo del conector;
+--   - respuesta, plazo agotado, desconexión y resultado incierto;
+--   - reintento de lectura no acusada y no-reintento de escritura ambigua;
+--   - límites de concurrencia y tamaño visibles para el cliente.
+--
+-- Excluye:
+--   - el contenido de las solicitudes y respuestas, que sólo atraviesa memoria
+--     efímera y no se modela como estado;
+--   - la ejecución de la operación, que ocurre en Vera local;
+--   - la idempotencia canónica por originId, que Vera conserva y el relay sólo
+--     transporta;
+--   - el emparejamiento (installation-link.allium) y la autorización
+--     (client-grants.allium);
+--   - la clasificación y retención de los eventos que aquí se emiten
+--     (privacy-and-audit.allium).
+--
+-- Depende de:
+--   - installation-link.allium para la instalación y su canal;
+--   - client-grants.allium para el cliente, sus alcances y su revocación;
+--   - Vera local, única autoridad sobre el efecto real de una operación.
+
+use "./installation-link.allium" as enlace
+use "./client-grants.allium" as concesiones
+use "./service-operations.allium" as operacion
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract EntregaDeSobre {
+    -- Obligación del conector de Vera Desktop sobre cada sobre recibido.
+    recibir: (request_id: String, principal_id: String, alcances: Set<concesiones/Alcance>) -> Boolean
+    responder: (request_id: String) -> Boolean
+
+    @invariant AcuseAntesDeEjecutar
+        -- El conector acusa recibo antes de ejecutar la operación en Vera
+        -- local. Sin acuse, el relay debe poder asumir que nada ocurrió.
+
+    @invariant IdempotenciaCanonicaEnVera
+        -- La deduplicación de escrituras vive en Vera mediante originId. El
+        -- conector propaga ese identificador; el relay no lo inventa ni lo
+        -- reescribe.
+
+    @guidance
+        -- Ante un sobre cuyo request_id ya fue visto, el conector consulta el
+        -- estado en Vera antes de volver a ejecutar.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ClaseDeOperacion {
+    -- La clase se deriva del método MCP, no de su contenido.
+    lectura | escritura
+}
+
+enum CodigoPublico {
+    -- Semántica de dominio con correspondencia uno a uno con el código HTTP
+    -- público indicado al lado. El cuerpo nunca añade detalle que una
+    -- credencial autorizada no pudiera conocer ya.
+    no_autenticada              -- 401
+    | sin_alcance               -- 403
+    | instalacion_desconocida   -- 404
+    | conflicto_de_enlace       -- 409
+    | excede_limite             -- 413
+    | cuota_agotada             -- 429
+    | escrituras_suspendidas    -- 503
+    | vera_offline              -- 503
+    | plazo_agotado             -- 504
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity SesionMcp {
+    -- Continuidad de transporte, no continuidad de memoria: cerrar una sesión
+    -- no cambia nada en Vera.
+    instalacion: enlace/Instalacion
+    cliente: concesiones/ClienteAutorizado
+    identificador: String
+    abierta_en: Timestamp
+    estado: abierta | cerrada
+    cerrada_en: Timestamp when estado = cerrada
+
+    transitions estado {
+        abierta -> cerrada
+        terminal: cerrada
+    }
+}
+
+entity SolicitudEnTransito {
+    -- Sobre efímero. Contiene identidad y medida, nunca contenido.
+    instalacion: enlace/Instalacion
+    cliente: concesiones/ClienteAutorizado?
+    sesion: SesionMcp?
+    request_id: String
+    clase: ClaseDeOperacion
+    alcance_requerido: concesiones/Alcance
+    bytes: Integer
+    origen_admitido: Boolean
+    recibida_en: Timestamp
+    plazo_en: Timestamp
+    acusada: Boolean
+    reintentos: Integer
+    estado: recibida | autenticada | entregada | respondida | rechazada | vera_desconectada | resultado_incierto
+
+    entregada_por: enlace/ConexionDeEnlace when estado = entregada | respondida | resultado_incierto
+    respondida_en: Timestamp when estado = respondida
+    codigo: CodigoPublico when estado = rechazada | vera_desconectada | resultado_incierto
+
+    -- Derivados: condiciones de admisión, para que las reglas de rechazo se
+    -- lean como decisiones y no como aritmética.
+    instalacion_utilizable: instalacion.estado in {conectada, desconectada}
+    cliente_utilizable: cliente != null and cliente.estado = autorizado
+    alcance_concedido: cliente_utilizable and cliente.concesion.permite(alcance_requerido)
+    clase_admitida_ahora: clase = lectura or operacion/servicio.escrituras_admitidas
+    en_vuelo: estado in {recibida, autenticada, entregada}
+
+    transitions estado {
+        recibida -> autenticada
+        recibida -> rechazada
+        autenticada -> entregada
+        autenticada -> vera_desconectada
+        entregada -> autenticada
+        entregada -> respondida
+        entregada -> resultado_incierto
+        terminal: respondida, rechazada, vera_desconectada, resultado_incierto
+    }
+
+    invariant EscrituraAmbiguaNoSeReintenta {
+        -- Invariante fuerte del producto: ante una entrega ambigua, una
+        -- escritura no vuelve a salir del relay bajo ninguna condición.
+        clase = escritura implies reintentos = 0
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Límites iniciales del piloto.
+    plazo_de_solicitud: Duration = 120.seconds
+    max_concurrentes_por_instalacion: Integer = 32
+    max_concurrentes_por_cliente: Integer = 8
+    bytes_maximos_por_solicitud: Integer = 10_485_760
+    bytes_maximos_por_fragmento: Integer = 65_536
+    max_reintentos_de_lectura: Integer = 1
+    bits_de_entropia_request_id: Integer = 128
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Sesión -----------------------------------------------------------------
+
+rule AbrirSesionMcp {
+    when: ClienteAbreSesionMcp(cliente)
+    requires: cliente.estado = autorizado
+    requires: cliente.instalacion.estado in {conectada, desconectada}
+    ensures: SesionMcp.created(
+        instalacion: cliente.instalacion,
+        cliente: cliente,
+        identificador: identificador_opaco(config.bits_de_entropia_request_id),
+        abierta_en: now,
+        estado: abierta
+    )
+}
+
+rule CerrarSesionMcp {
+    when: ClienteCierraSesionMcp(sesion)
+    requires: sesion.estado = abierta
+    ensures:
+        sesion.estado = cerrada
+        sesion.cerrada_en = now
+}
+
+rule CerrarSesionesAlTerminarElAcceso {
+    when: concesiones/AccesoDeClienteTerminado(cli, motivo)
+    for sesion in SesionesMcp where estado = abierta:
+        requires: sesion.cliente = cli
+        ensures:
+            sesion.estado = cerrada
+            sesion.cerrada_en = now
+}
+
+-- Aceptar ----------------------------------------------------------------
+
+rule AceptarSolicitudMcp {
+    when: ClienteEnviaSolicitudMcp(instalacion, credencial, origen_admitido, clase, alcance_requerido, bytes, sesion?)
+    ensures: SolicitudEnTransito.created(
+        instalacion: instalacion,
+        cliente: cliente_por_credencial(instalacion, credencial),
+        sesion: sesion,
+        request_id: identificador_opaco(config.bits_de_entropia_request_id),
+        clase: clase,
+        alcance_requerido: alcance_requerido,
+        bytes: bytes,
+        origen_admitido: origen_admitido,
+        recibida_en: now,
+        plazo_en: now + config.plazo_de_solicitud,
+        acusada: false,
+        reintentos: 0,
+        estado: recibida
+    )
+
+    @guidance
+        -- La credencial presentada se resuelve aquí y no se conserva: el
+        -- sobre lleva la identidad derivada del cliente, jamás el bearer.
+        -- Los fragmentos del cuerpo se transmiten en streaming; el tamaño se
+        -- comprueba antes de deserializar.
+}
+
+rule RechazarPorTamano {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes > config.bytes_maximos_por_solicitud
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = excede_limite
+        SolicitudConcluida(solicitud: solicitud)
+}
+
+rule RechazarPorOrigen {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: not solicitud.origen_admitido
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = sin_alcance
+        SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- Origen hostil o rebinding de DNS. Nunca se refleja un origen
+        -- arbitrario ni se usa comodín con credenciales.
+}
+
+rule RechazarPorInstalacionNoUtilizable {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: solicitud.origen_admitido
+    requires: not solicitud.instalacion_utilizable
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = instalacion_desconocida
+        SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- Una instalación revocada y una inexistente producen exactamente el
+        -- mismo resultado. La diferencia no es observable desde fuera.
+}
+
+rule RechazarPorCredencial {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: solicitud.origen_admitido
+    requires: solicitud.instalacion_utilizable
+    requires: not solicitud.cliente_utilizable
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = no_autenticada
+        SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- Cubre credencial ausente, credencial desconocida, cliente revocado
+        -- y cliente expirado con el mismo resultado observable.
+}
+
+rule RechazarPorAlcance {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: solicitud.origen_admitido
+    requires: solicitud.instalacion_utilizable
+    requires: solicitud.cliente_utilizable
+    requires: not solicitud.alcance_concedido
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = sin_alcance
+        SolicitudConcluida(solicitud: solicitud)
+}
+
+rule RechazarEscrituraSuspendida {
+    -- Un incidente de confidencialidad cierra escrituras antes que
+    -- disponibilidad: la lectura sigue, la escritura se rechaza diciéndolo.
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: solicitud.origen_admitido
+    requires: solicitud.instalacion_utilizable
+    requires: solicitud.alcance_concedido
+    requires: not solicitud.clase_admitida_ahora
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = escrituras_suspendidas
+        SolicitudConcluida(solicitud: solicitud)
+}
+
+rule RechazarPorCuota {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: solicitud.origen_admitido
+    requires: solicitud.instalacion_utilizable
+    requires: solicitud.alcance_concedido
+    requires: solicitud.clase_admitida_ahora
+    requires:
+        en_vuelo_de_instalacion(solicitud.instalacion) > config.max_concurrentes_por_instalacion
+        or en_vuelo_de_cliente(solicitud.cliente) > config.max_concurrentes_por_cliente
+    ensures:
+        solicitud.estado = rechazada
+        solicitud.codigo = cuota_agotada
+        SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- La respuesta indica cuándo reintentar. Agotar la cuota es una
+        -- respuesta legítima del producto, no una caída del servicio.
+}
+
+rule AutenticarSolicitud {
+    when: solicitud: SolicitudEnTransito.created
+    requires: solicitud.estado = recibida
+    requires: solicitud.bytes <= config.bytes_maximos_por_solicitud
+    requires: solicitud.origen_admitido
+    requires: solicitud.instalacion_utilizable
+    requires: solicitud.alcance_concedido
+    requires: solicitud.clase_admitida_ahora
+    requires: en_vuelo_de_instalacion(solicitud.instalacion) <= config.max_concurrentes_por_instalacion
+    requires: en_vuelo_de_cliente(solicitud.cliente) <= config.max_concurrentes_por_cliente
+    ensures: solicitud.estado = autenticada
+}
+
+-- Entregar ---------------------------------------------------------------
+
+rule EntregarSolicitud {
+    when: solicitud: SolicitudEnTransito.estado transitions_to autenticada
+    requires: solicitud.instalacion.estado = conectada
+    ensures:
+        solicitud.estado = entregada
+        solicitud.entregada_por = solicitud.instalacion.conexion_activa
+}
+
+rule VeraNoConectadaAlEntregar {
+    when: solicitud: SolicitudEnTransito.estado transitions_to autenticada
+    requires: solicitud.instalacion.estado != conectada
+    ensures:
+        solicitud.estado = vera_desconectada
+        solicitud.codigo = vera_offline
+        SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- Nunca se encola ni se promete ejecución posterior. Con Vera Desktop
+        -- apagada no existe una copia servible del grafo.
+}
+
+rule DesktopAcusaRecibo {
+    when: DesktopAcusaReciboDeSobre(solicitud)
+    requires: solicitud.estado = entregada
+    ensures: solicitud.acusada = true
+}
+
+rule ResponderSolicitud {
+    when: DesktopResponde(solicitud, conexion)
+    requires: solicitud.estado = entregada
+    requires: conexion = solicitud.entregada_por
+    requires: conexion.instalacion = solicitud.instalacion
+    ensures:
+        solicitud.estado = respondida
+        solicitud.respondida_en = now
+        SolicitudConcluida(solicitud: solicitud)
+}
+
+-- Terminar mal -----------------------------------------------------------
+
+rule PlazoAgotadoTrasEntrega {
+    when: solicitud: SolicitudEnTransito.plazo_en <= now
+    requires: solicitud.estado = entregada
+    ensures:
+        solicitud.estado = resultado_incierto
+        solicitud.codigo = plazo_agotado
+        SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- El plazo sólo se amplía por actividad de streaming explícita. Al
+        -- agotarse, el resultado es incierto, no fallido.
+}
+
+rule SolicitudEntregadaQuedaIncierta {
+    when: enlace/VeraDesconectada(inst, motivo)
+    for solicitud in SolicitudesEnTransito where estado = entregada:
+        requires: solicitud.instalacion = inst
+        requires: solicitud.estado = entregada
+        ensures:
+            solicitud.estado = resultado_incierto
+            solicitud.codigo = vera_offline
+            SolicitudConcluida(solicitud: solicitud)
+
+    @guidance
+        -- Si el canal cae después de aceptar una escritura y antes de
+        -- responder, esto es lo único honesto que puede decirse. El cliente
+        -- debe consultar estado e idempotencia en Vera.
+}
+
+rule SolicitudAutenticadaSinVera {
+    when: enlace/VeraDesconectada(inst, motivo)
+    for solicitud in SolicitudesEnTransito where estado = autenticada:
+        requires: solicitud.instalacion = inst
+        requires: solicitud.estado = autenticada
+        ensures:
+            solicitud.estado = vera_desconectada
+            solicitud.codigo = vera_offline
+            SolicitudConcluida(solicitud: solicitud)
+}
+
+rule ReintentarLecturaNoAcusada {
+    -- Único reintento automático del sistema: una lectura que el conector
+    -- nunca acusó, sobre un enlace que acaba de ser desplazado por otra
+    -- conexión de la misma instalación.
+    when: enlace/EnlaceDesplazado(inst, identificador_efimero)
+    for solicitud in SolicitudesEnTransito where estado = entregada:
+        requires: solicitud.instalacion = inst
+        requires: solicitud.clase = lectura
+        requires: not solicitud.acusada
+        requires: solicitud.reintentos < config.max_reintentos_de_lectura
+        ensures:
+            solicitud.estado = autenticada
+            solicitud.entregada_por = null
+            solicitud.reintentos = solicitud.reintentos + 1
+}
+
+rule EntregaDesplazadaQuedaIncierta {
+    when: enlace/EnlaceDesplazado(inst, identificador_efimero)
+    for solicitud in SolicitudesEnTransito where estado = entregada:
+        requires: solicitud.instalacion = inst
+        requires:
+            solicitud.clase = escritura
+            or solicitud.acusada
+            or solicitud.reintentos >= config.max_reintentos_de_lectura
+        ensures:
+            solicitud.estado = resultado_incierto
+            solicitud.codigo = conflicto_de_enlace
+            SolicitudConcluida(solicitud: solicitud)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant IdPublicoNoAutoriza {
+    -- Ninguna solicitud avanza más allá de recibida sin un cliente
+    -- identificado: conocer el identificador público no basta.
+    for s in SolicitudesEnTransito:
+        s.estado in {autenticada, entregada, respondida} implies s.cliente != null
+}
+
+invariant SolicitudNoCruzaDeInstalacion {
+    for s in SolicitudesEnTransito:
+        s.cliente != null implies s.cliente.instalacion = s.instalacion
+}
+
+invariant SesionNoCruzaDeInstalacion {
+    for s in SolicitudesEnTransito:
+        s.sesion != null implies s.sesion.instalacion = s.instalacion
+}
+
+invariant RespuestaCorrespondeAlMismoEnlace {
+    -- Una respuesta exitosa vuelve por la conexión de la misma instalación
+    -- por la que salió la solicitud.
+    for s in SolicitudesEnTransito:
+        s.estado = respondida implies s.entregada_por.instalacion = s.instalacion
+}
+
+invariant ApagadoSignificaCerrado {
+    -- El relay no encola: una solicitud en vuelo exige a Vera conectada.
+    for s in SolicitudesEnTransito:
+        s.estado in {autenticada, entregada} implies s.instalacion.estado = conectada
+}
+
+invariant RevocacionImpideNuevasSolicitudes {
+    -- Toda solicitud de un cliente revocado fue aceptada antes de la
+    -- revocación. Después no se acepta ninguna.
+    for s in SolicitudesEnTransito:
+        s.cliente != null and s.cliente.estado = revocado
+            implies s.recibida_en < s.cliente.revocado_en
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ClienteMcpRemoto {
+    identified_by: concesiones/ClienteAutorizado where estado = autorizado
+}
+
+actor ConectorDesktopConectado {
+    identified_by: enlace/Instalacion where estado = conectada
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EndpointMcp {
+    -- Puerta pública y estable de una instalación. Ubica; no autoriza.
+    facing cliente: ClienteMcpRemoto
+
+    exposes:
+        cliente.instalacion.id_publico
+        cliente.instalacion.estado
+        cliente.concesion.alcances
+
+    provides:
+        ClienteAbreSesionMcp(cliente)
+        ClienteEnviaSolicitudMcp(
+            cliente.instalacion,
+            credencial,
+            origen_admitido,
+            clase,
+            alcance_requerido,
+            bytes,
+            sesion
+        )
+
+    @guarantee ErroresConSemanticaDeDominio
+        -- Todo final tiene un motivo nombrado: no autenticada, sin alcance,
+        -- instalación desconocida, conflicto de enlace, excede límite, cuota
+        -- agotada, Vera desconectada o plazo agotado. "Error de red" no es un
+        -- resultado admisible.
+
+    @guarantee SinFiltracionDeExistencia
+        -- Los cuerpos no revelan si existe una página, una persona o una
+        -- instalación más allá de lo que la credencial ya podría saber.
+}
+
+surface ResultadoDeSolicitudMcp {
+    facing consumidor: ClienteMcpRemoto
+
+    context solicitud: SolicitudEnTransito where cliente = consumidor
+
+    exposes:
+        solicitud.request_id
+        solicitud.estado
+        solicitud.clase
+        solicitud.codigo
+            when solicitud.estado in {rechazada, vera_desconectada, resultado_incierto}
+
+    provides:
+        ClienteCierraSesionMcp(solicitud.sesion) when solicitud.sesion != null
+
+    @guarantee EscrituraInciertaNoSeAfirma
+        -- Ante resultado incierto, el cliente recibe la instrucción de
+        -- consultar estado e idempotencia en Vera. El relay no reenvía la
+        -- escritura ni afirma que tuvo éxito.
+
+    timeout:
+        PlazoAgotadoTrasEntrega
+}
+
+surface EntregaAlConector {
+    -- Lo que Vera Desktop ve de una solicitud: identidad y medida, jamás
+    -- contenido persistido.
+    facing conector: ConectorDesktopConectado
+
+    context solicitud: SolicitudEnTransito
+        where estado = entregada and instalacion = conector
+
+    exposes:
+        solicitud.request_id
+        solicitud.clase
+        solicitud.alcance_requerido
+        solicitud.bytes
+        solicitud.plazo_en
+        solicitud.entregada_por
+
+    provides:
+        DesktopAcusaReciboDeSobre(solicitud)
+        DesktopResponde(solicitud, solicitud.entregada_por)
+
+    contracts:
+        demands EntregaDeSobre
+
+    @guarantee SobreSinContenido
+        -- El sobre lleva request_id, sesión, método, cabeceras permitidas,
+        -- identidad derivada, alcances, plazo y medida. Nada más cruza, y
+        -- nada de lo que cruza se conserva.
+
+    @guidance
+        -- Los fragmentos del cuerpo viajan con un máximo por trozo para no
+        -- retener cuerpos grandes en memoria del relay.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "¿Qué clientes MCP concretos forman la matriz de compatibilidad v1? Se prueba primero con MCP Inspector y Hermes; ChatGPT y Claude dependen de que su producto admita servidores MCP remotos, lo que no está verificado."
+
+open question "¿Un reintento de lectura no acusada es aceptable para el producto, o toda entrega ambigua debe terminar en resultado incierto sin excepción? El modelo actual permite un solo reintento y sólo tras un desplazamiento de enlace."
+
+open question "¿Qué debe ocurrir con una sesión MCP cuya instalación se reconecta con otra conexión? Hoy la sesión sobrevive al desplazamiento; podría exigirse renegociación."
+
+open question "¿El plazo de 120 s se amplía por actividad de streaming de forma automática o sólo ante un evento explícito del conector? La diferencia cambia el significado del código de plazo agotado."

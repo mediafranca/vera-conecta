@@ -1,0 +1,522 @@
+-- allium: 3
+--
+-- Vera Conecta — privacidad y auditoría
+--
+-- Qué garantiza esta spec: que el relay conserva estado de control y nada
+-- más, que lo que conserva caduca, y que eliminar una instalación deja
+-- evidencia del borrado sin conservar lo borrado.
+--
+-- Incluye:
+--   - clases de dato admitidas y prohibidas en el estado persistido;
+--   - clases de campo admitidas y prohibidas en los registros operativos;
+--   - asiento de auditoría sin payload, su agregación y su caducidad;
+--   - eliminación de una instalación con periodo de recuperación;
+--   - constancia de borrado sin contenido borrado.
+--
+-- Excluye:
+--   - el contenido MCP, que no es estado de este sistema en ningún momento;
+--   - el grafo de Vera y sus copias de seguridad, que son responsabilidad de
+--     Vera local: perder el relay no puede perder memoria;
+--   - la revocación en sí (client-grants.allium) y la caída de enlace
+--     (installation-link.allium), de las que esta spec sólo toma constancia;
+--   - la respuesta a incidentes (service-operations.allium).
+--
+-- Depende de:
+--   - installation-link.allium, client-grants.allium y mcp-relay.allium como
+--     fuentes de los eventos que aquí se clasifican;
+--   - una evaluación jurídica pendiente sobre la Ley 21.719 y los roles de
+--     tratamiento de MediaFranca.
+
+use "./installation-link.allium" as enlace
+use "./client-grants.allium" as concesiones
+use "./mcp-relay.allium" as relay
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity OperadorDeMediaFranca {
+    -- Quien despliega y observa salud. Su identidad se administra fuera del
+    -- relay y su acceso nunca alcanza contenido.
+    tiene_acceso_operacional: Boolean
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract MinimizacionEnTransito {
+    -- Obligación del relay sobre todo lo que atraviesa su memoria.
+    transportar: (request_id: String, bytes: Integer) -> Boolean
+
+    @invariant ContenidoNoSobreviveAlTransito
+        -- Páginas, bloques, prompts, argumentos, resultados y adjuntos
+        -- existen en memoria durante el tránsito y en ningún otro momento.
+
+    @invariant CredencialNoSeRegistra
+        -- La cabecera de autorización original no se escribe en ningún
+        -- almacén ni registro, ni siquiera truncada de forma reversible.
+
+    @guidance
+        -- Los cuerpos se transmiten en streaming y se fragmentan. Un buffer
+        -- completo en memoria es, además de un riesgo de costo, una tentación
+        -- de persistencia.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ClaseDeDato {
+    -- Admitidas en el estado persistido del relay.
+    version
+    | marca_de_tiempo
+    | estado_de_control
+    | hash_de_credencial
+    | alcance
+    | contador
+    | revocacion
+    | identificador_aleatorio
+    | codigo_de_error_clasificado
+    -- Prohibidas. Se nombran para que la prohibición sea comprobable y no
+    -- sólo una promesa en prosa.
+    | titulo_de_pagina
+    | bloque
+    | prompt
+    | argumento_de_herramienta
+    | resultado_de_herramienta
+    | cabecera_de_autorizacion
+    | adjunto
+    | transcripcion
+    | secreto_vera_local
+    | cuerpo_de_respuesta
+}
+
+enum ClaseDeCampoDeRegistro {
+    -- Admitidas en los registros operativos.
+    identificador_pseudonimo
+    | tiempo
+    | bytes_transferidos
+    | clase_de_operacion
+    | codigo_de_estado
+    | version_de_protocolo
+    | latencia
+    | region
+    -- Prohibidas.
+    | cuerpo
+    | argumento
+    | resultado
+    | titulo
+    | token
+    | cookie
+    | cabecera_libre
+}
+
+enum ClaseDeEventoOperativo {
+    solicitud_mcp
+    | enlace_desplazado
+    | enlace_rechazado
+    | acceso_de_cliente_terminado
+    | eliminacion_ejecutada
+}
+
+enum ClaseDeBorrado {
+    estado_de_instalacion
+    | asiento_detallado
+    | metrica_agregada
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity RegistroDeControl {
+    -- Todo lo que el relay conserva sobre una instalación. La lista de clases
+    -- es la frontera de privacidad hecha dato.
+    instalacion: enlace/Instalacion
+    clases: Set<ClaseDeDato>
+    creado_en: Timestamp
+
+    invariant SoloClasesAdmitidas {
+        clases.all(c => c in {
+            version,
+            marca_de_tiempo,
+            estado_de_control,
+            hash_de_credencial,
+            alcance,
+            contador,
+            revocacion,
+            identificador_aleatorio,
+            codigo_de_error_clasificado
+        })
+    }
+}
+
+entity AsientoDeAuditoria {
+    -- Evento operativo: metadato sin payload, para disponibilidad y abuso.
+    clase_de_evento: ClaseDeEventoOperativo
+    campos: Set<ClaseDeCampoDeRegistro>
+    registrado_en: Timestamp
+    estado: detallado | agregado
+    instalacion: enlace/Instalacion?
+    cliente: concesiones/ClienteAutorizado?
+    clase_de_operacion: relay/ClaseDeOperacion?
+    codigo: relay/CodigoPublico?
+    latencia: Duration?
+    bytes: Integer?
+
+    transitions estado {
+        detallado -> agregado
+        terminal: agregado
+    }
+
+    invariant SoloCamposAdmitidos {
+        campos.all(c => c in {
+            identificador_pseudonimo,
+            tiempo,
+            bytes_transferidos,
+            clase_de_operacion,
+            codigo_de_estado,
+            version_de_protocolo,
+            latencia,
+            region
+        })
+    }
+}
+
+entity EliminacionDeInstalacion {
+    -- Eliminar borra el estado del relay. No toca el grafo local, que es la
+    -- memoria de verdad.
+    instalacion: enlace/Instalacion
+    solicitada_en: Timestamp
+    ejecutable_en: Timestamp
+    estado: en_recuperacion | cancelada | ejecutada
+    resuelta_en: Timestamp when estado = cancelada | ejecutada
+
+    transitions estado {
+        en_recuperacion -> cancelada
+        en_recuperacion -> ejecutada
+        terminal: cancelada, ejecutada
+    }
+}
+
+entity ConstanciaDeBorrado {
+    -- Evidencia de que algo se borró, sin conservar lo borrado.
+    referencia_pseudonima: String
+    clase: ClaseDeBorrado
+    ejecutado_en: Timestamp
+    elementos: Integer
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Retenciones iniciales, pendientes de confirmación jurídica.
+    retencion_de_eventos_detallados: Duration = 14.days
+    retencion_de_metricas_agregadas: Duration = 90.days
+    periodo_de_recuperacion_de_eliminacion: Duration = 7.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Registrar sin contenido -------------------------------------------------
+
+rule AbrirRegistroDeControl {
+    when: enlace/EmparejamientoCompletado(instalacion, version_ofrecida)
+    ensures: RegistroDeControl.created(
+        instalacion: instalacion,
+        clases: {
+            version,
+            marca_de_tiempo,
+            estado_de_control,
+            hash_de_credencial,
+            alcance,
+            contador,
+            revocacion,
+            identificador_aleatorio,
+            codigo_de_error_clasificado
+        },
+        creado_en: now
+    )
+}
+
+rule RegistrarSolicitudRespondida {
+    when: relay/SolicitudConcluida(solicitud)
+    requires: solicitud.estado = respondida
+    ensures: AsientoDeAuditoria.created(
+        clase_de_evento: solicitud_mcp,
+        campos: {
+            identificador_pseudonimo,
+            tiempo,
+            bytes_transferidos,
+            clase_de_operacion,
+            codigo_de_estado,
+            latencia
+        },
+        registrado_en: now,
+        estado: detallado,
+        instalacion: solicitud.instalacion,
+        cliente: solicitud.cliente,
+        clase_de_operacion: solicitud.clase,
+        latencia: solicitud.respondida_en - solicitud.recibida_en,
+        bytes: solicitud.bytes
+    )
+}
+
+rule RegistrarSolicitudNoConcluyente {
+    when: relay/SolicitudConcluida(solicitud)
+    requires: solicitud.estado in {rechazada, vera_desconectada, resultado_incierto}
+    ensures: AsientoDeAuditoria.created(
+        clase_de_evento: solicitud_mcp,
+        campos: {
+            identificador_pseudonimo,
+            tiempo,
+            bytes_transferidos,
+            clase_de_operacion,
+            codigo_de_estado,
+            latencia
+        },
+        registrado_en: now,
+        estado: detallado,
+        instalacion: solicitud.instalacion,
+        cliente: solicitud.cliente,
+        clase_de_operacion: solicitud.clase,
+        codigo: solicitud.codigo,
+        latencia: now - solicitud.recibida_en,
+        bytes: solicitud.bytes
+    )
+
+    @guidance
+        -- El código clasificado basta para investigar un aumento de 401 o de
+        -- 503. El argumento que produjo el error no hace falta y no está
+        -- disponible.
+}
+
+rule RegistrarEnlaceDesplazado {
+    when: enlace/EnlaceDesplazado(instalacion, identificador_efimero)
+    ensures: AsientoDeAuditoria.created(
+        clase_de_evento: enlace_desplazado,
+        campos: {identificador_pseudonimo, tiempo, version_de_protocolo},
+        registrado_en: now,
+        estado: detallado,
+        instalacion: instalacion
+    )
+}
+
+rule RegistrarEnlaceRechazado {
+    when: enlace/EnlaceRechazado(instalacion, motivo, identificador_efimero)
+    ensures: AsientoDeAuditoria.created(
+        clase_de_evento: enlace_rechazado,
+        campos: {identificador_pseudonimo, tiempo, codigo_de_estado},
+        registrado_en: now,
+        estado: detallado,
+        instalacion: instalacion
+    )
+}
+
+rule RegistrarAccesoTerminado {
+    when: concesiones/AccesoDeClienteTerminado(cliente, motivo)
+    ensures: AsientoDeAuditoria.created(
+        clase_de_evento: acceso_de_cliente_terminado,
+        campos: {identificador_pseudonimo, tiempo},
+        registrado_en: now,
+        estado: detallado,
+        instalacion: cliente.instalacion,
+        cliente: cliente
+    )
+}
+
+-- Retener y caducar -------------------------------------------------------
+
+rule AsientoDetalladoSeAgrega {
+    when: asiento: AsientoDeAuditoria.registrado_en + config.retencion_de_eventos_detallados <= now
+    requires: asiento.estado = detallado
+    ensures:
+        asiento.estado = agregado
+        asiento.instalacion = null
+        asiento.cliente = null
+
+    @guidance
+        -- Agregar no es archivar: al perder el vínculo con la instalación y
+        -- el cliente, el asiento deja de ser un dato sobre una persona.
+}
+
+rule MetricaAgregadaCaduca {
+    when: asiento: AsientoDeAuditoria.registrado_en + config.retencion_de_metricas_agregadas <= now
+    requires: asiento.estado = agregado
+    ensures:
+        not exists asiento
+        ConstanciaDeBorrado.created(
+            referencia_pseudonima: identificador_opaco(asiento.registrado_en),
+            clase: metrica_agregada,
+            ejecutado_en: now,
+            elementos: 1
+        )
+}
+
+-- Eliminar ----------------------------------------------------------------
+
+rule SolicitarEliminacionDeInstalacion {
+    when: DesktopSolicitaEliminacionDeInstalacion(instalacion)
+    requires: instalacion.estado = revocada
+    ensures: EliminacionDeInstalacion.created(
+        instalacion: instalacion,
+        solicitada_en: now,
+        ejecutable_en: now + config.periodo_de_recuperacion_de_eliminacion,
+        estado: en_recuperacion
+    )
+
+    @guidance
+        -- Sólo se elimina lo ya revocado: eliminar no es una vía alternativa
+        -- para cortar el acceso, es lo que ocurre después de haberlo cortado.
+}
+
+rule CancelarEliminacionDeInstalacion {
+    when: DesktopCancelaEliminacionDeInstalacion(eliminacion)
+    requires: eliminacion.estado = en_recuperacion
+    ensures:
+        eliminacion.estado = cancelada
+        eliminacion.resuelta_en = now
+}
+
+rule EjecutarEliminacionDeInstalacion {
+    when: eliminacion: EliminacionDeInstalacion.ejecutable_en <= now
+    requires: eliminacion.estado = en_recuperacion
+    ensures:
+        eliminacion.estado = ejecutada
+        eliminacion.resuelta_en = now
+        for registro in RegistrosDeControl where instalacion = eliminacion.instalacion:
+            not exists registro
+        ConstanciaDeBorrado.created(
+            referencia_pseudonima: hash(eliminacion.instalacion.id_publico),
+            clase: estado_de_instalacion,
+            ejecutado_en: now,
+            elementos: 1
+        )
+        EstadoDeInstalacionBorrado(instalacion: eliminacion.instalacion)
+
+    @guidance
+        -- Queda constancia del borrado y no queda lo borrado. La constancia
+        -- usa una referencia pseudónima: sirve para responder "sí, se borró",
+        -- no para reconstruir a quién pertenecía.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant AsientoAgregadoSinIdentidad {
+    -- Pasada la retención detallada, ningún asiento apunta a una instalación
+    -- ni a un cliente concretos.
+    for a in AsientosDeAuditoria:
+        a.estado = agregado implies a.instalacion = null and a.cliente = null
+}
+
+invariant ConstanciaSinContenido {
+    -- La evidencia de borrado no conserva el identificador público en claro.
+    for c in ConstanciasDeBorrado:
+        c.referencia_pseudonima != ""
+}
+
+invariant RegistroDeControlUnicoPorInstalacion {
+    -- El estado de control de una instalación vive en un solo lugar: no hay
+    -- copias parciales repartidas que un borrado pueda pasar por alto.
+    for a in RegistrosDeControl:
+        for b in RegistrosDeControl:
+            a != b implies a.instalacion != b.instalacion
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Operador {
+    identified_by: OperadorDeMediaFranca where tiene_acceso_operacional
+}
+
+actor ConectorDesktop {
+    identified_by: enlace/Instalacion where estado in {conectada, desconectada, revocada}
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EventosOperativos {
+    -- Lo que MediaFranca puede ver. Nunca contenido, nunca credenciales.
+    facing operador: Operador
+
+    context asiento: AsientoDeAuditoria
+
+    exposes:
+        asiento.clase_de_evento
+        asiento.campos
+        asiento.registrado_en
+        asiento.estado
+        asiento.clase_de_operacion
+        asiento.codigo
+        asiento.latencia
+        asiento.bytes
+
+    @guarantee SinContenidoNiCredenciales
+        -- Esta superficie no expone cuerpos, argumentos, resultados, títulos,
+        -- tokens, cookies ni cabeceras libres, ni siquiera durante un
+        -- incidente.
+
+    @guarantee IdentificadoresPseudonimos
+        -- Los identificadores expuestos son aleatorios y no derivan de datos
+        -- de la persona.
+
+    timeout:
+        AsientoDetalladoSeAgrega
+}
+
+surface ControlDeDatosDeLaInstalacion {
+    -- Lo que la persona propietaria decide sobre el estado que el relay
+    -- conserva de ella. En el piloto lo presenta Vera Desktop.
+    facing conector: ConectorDesktop
+
+    let eliminaciones = EliminacionesDeInstalacion where instalacion = conector
+
+    exposes:
+        conector.estado
+        for eliminacion in eliminaciones:
+            eliminacion.solicitada_en
+            eliminacion.ejecutable_en
+            eliminacion.estado
+
+    provides:
+        DesktopSolicitaEliminacionDeInstalacion(conector)
+            when conector.estado = revocada
+        for eliminacion in eliminaciones:
+            DesktopCancelaEliminacionDeInstalacion(eliminacion)
+                when eliminacion.estado = en_recuperacion
+
+    @guarantee BorrarNoRevelaExistencia
+        -- Una instalación eliminada no revela si existió a quien no está
+        -- autorizado: se comporta igual que un identificador que nunca
+        -- existió.
+
+    @guarantee ElBorradoNoAlcanzaAVera
+        -- Eliminar el estado del relay no borra ni una página del grafo
+        -- local. Perder el relay obliga a reconectar clientes, nunca a
+        -- perder memoria.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "¿Qué metadatos operativos y qué retenciones acepta jurídicamente MediaFranca bajo la Ley 21.719? Los 14 y 90 días son una propuesta técnica sin revisión legal, y de ella depende el rol de tratamiento que MediaFranca asume."
+
+open question "¿Cuánto dura el periodo de recuperación antes de ejecutar la eliminación de una instalación? El valor de config es una suposición: no hay decisión."
+
+open question "¿Qué constituye evidencia suficiente de borrado para una persona que la solicita? Hoy existe una constancia pseudónima interna; no está definido si la persona debe poder verla ni cómo se la mostraría sin identificarla."
+
+open question "¿Debe existir una exportación cifrada del estado de control para recuperar el servicio, y qué la distingue de una copia que el relay no debería tener?"
+
+open question "¿Qué ocurre con los asientos de auditoría de una instalación eliminada antes de cumplir su retención? Hoy sobreviven anonimizados; podría exigirse su borrado inmediato."

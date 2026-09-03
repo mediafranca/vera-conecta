@@ -1,0 +1,353 @@
+-- allium: 3
+--
+-- Vera Conecta — operación del servicio
+--
+-- Qué garantiza esta spec: que la degradación es un estado nombrado y no una
+-- sorpresa, que un incidente cierra escrituras antes que disponibilidad, y
+-- que un despliegue defectuoso se revierte sin dejar conectores antiguos
+-- fallando en silencio.
+--
+-- Incluye:
+--   - modo de servicio: normal, degradado y escrituras suspendidas;
+--   - despliegue en servicio, retirada y reversión;
+--   - compatibilidad de versión de protocolo entre relay y conector;
+--   - objetivos de servicio del piloto, declarados como configuración;
+--   - estados visibles para la persona y para el operador.
+--
+-- Excluye:
+--   - la aplicación de límites por solicitud, que ocurre en mcp-relay.allium;
+--   - la clasificación y retención de eventos (privacy-and-audit.allium);
+--   - el costo y las alertas de facturación, que no son comportamiento
+--     observable por ningún actor de este sistema;
+--   - la infraestructura concreta: qué proveedor ejecuta el relay es una
+--     decisión reversible y no aparece aquí.
+--
+-- Depende de:
+--   - installation-link.allium para la compuerta de versión del canal;
+--   - un presupuesto de piloto todavía sin cerrar, del que dependen los
+--     objetivos declarados abajo.
+--
+-- Nota: los objetivos de config son objetivos a validar, no promesas
+-- públicas. Ninguna regla de este sistema promete cumplirlos.
+
+use "./installation-link.allium" as enlace
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity OperadorDeMediaFranca {
+    tiene_acceso_operacional: Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum MotivoDeDegradacion {
+    latencia_excesiva
+    | dependencia_caida
+    | despliegue_defectuoso
+    | incidente_de_confidencialidad
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ModoDeServicio {
+    -- Estado del servicio como tal, no de una instalación concreta.
+    estado: normal | degradado | escrituras_suspendidas
+    desde: Timestamp?
+    motivo: MotivoDeDegradacion?
+
+    escrituras_admitidas: estado in {normal, degradado}
+}
+
+entity Despliegue {
+    identificador: String
+    version_del_relay: Integer
+    version_de_protocolo_minima: Integer
+    version_de_protocolo_maxima: Integer
+    publicado_en: Timestamp
+    estado: en_servicio | retirado
+    retirado_en: Timestamp when estado = retirado
+
+    admite(v): v >= version_de_protocolo_minima and v <= version_de_protocolo_maxima
+
+    transitions estado {
+        en_servicio -> retirado
+        terminal: retirado
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Compuerta de versión: el valor autoritativo vive junto al canal.
+    version_de_protocolo_minima: Integer = enlace/config.version_minima_admitida
+    version_de_protocolo_maxima: Integer = enlace/config.version_maxima_admitida
+
+    -- Cuántas versiones de esquema deben seguir siendo aceptadas.
+    versiones_compatibles_hacia_atras: Integer = 1
+
+    -- Objetivos del piloto. A validar con mediciones, no a prometer.
+    disponibilidad_mensual_objetivo: Decimal = 99.5
+    deteccion_de_caida_objetivo: Duration = enlace/config.umbral_de_latido
+    overhead_p95_objetivo_en_milisegundos: Integer = 500
+    revocacion_efectiva_objetivo: Duration = 10.seconds
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+default ModoDeServicio servicio = { estado: normal }
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Degradar y restablecer --------------------------------------------------
+
+rule DeclararDegradacion {
+    when: OperadorDeclaraDegradacion(operador, motivo)
+    requires: servicio.estado = normal
+    requires: motivo != incidente_de_confidencialidad
+    ensures:
+        servicio.estado = degradado
+        servicio.desde = now
+        servicio.motivo = motivo
+        ModoDeServicioCambiado(estado: degradado, motivo: motivo)
+
+    @guidance
+        -- Degradado no es caído: el servicio sigue respondiendo y lo dice.
+        -- Un aumento de 401 o 403 nunca se responde relajando la
+        -- autenticación para recuperar disponibilidad.
+}
+
+rule SuspenderEscriturasPorIncidente {
+    -- Ante un incidente que pueda afectar confidencialidad se sacrifica
+    -- disponibilidad de escritura antes que confidencialidad.
+    when: OperadorDeclaraIncidenteDeConfidencialidad(operador, motivo)
+    requires: servicio.estado in {normal, degradado}
+    ensures:
+        servicio.estado = escrituras_suspendidas
+        servicio.desde = now
+        servicio.motivo = motivo
+        ModoDeServicioCambiado(estado: escrituras_suspendidas, motivo: motivo)
+
+    @guidance
+        -- Cerrar nuevas escrituras, rotar secretos operacionales y preservar
+        -- los metadatos de auditoría. El contenido no debería existir en el
+        -- relay para poder ser recuperado por nadie.
+}
+
+rule RestablecerServicio {
+    when: OperadorRestableceServicio(operador)
+    requires: servicio.estado in {degradado, escrituras_suspendidas}
+    ensures:
+        servicio.estado = normal
+        servicio.desde = now
+        servicio.motivo = null
+        ModoDeServicioCambiado(estado: normal, motivo: null)
+}
+
+-- Desplegar y revertir ----------------------------------------------------
+
+rule PublicarDespliegue {
+    when: OperadorPublicaDespliegue(operador, version_del_relay, version_minima, version_maxima)
+    requires: version_maxima >= version_minima
+    requires: version_maxima - version_minima >= config.versiones_compatibles_hacia_atras - 1
+    ensures:
+        for anterior in Despliegues where estado = en_servicio:
+            anterior.estado = retirado
+            anterior.retirado_en = now
+        Despliegue.created(
+            identificador: identificador_opaco(version_del_relay),
+            version_del_relay: version_del_relay,
+            version_de_protocolo_minima: version_minima,
+            version_de_protocolo_maxima: version_maxima,
+            publicado_en: now,
+            estado: en_servicio
+        )
+        DespliegueEnServicio(version_del_relay: version_del_relay)
+
+    @guidance
+        -- Un cambio de esquema debe seguir aceptando al menos la versión
+        -- anterior del conector. Una Desktop antigua sigue operando o recibe
+        -- un rechazo explícito de versión; nunca un fallo silencioso.
+}
+
+rule RevertirDespliegue {
+    when: OperadorRevierteDespliegue(operador, anterior)
+    requires: anterior.estado = retirado
+    ensures:
+        for actual in Despliegues where estado = en_servicio:
+            actual.estado = retirado
+            actual.retirado_en = now
+        Despliegue.created(
+            identificador: identificador_opaco(anterior.version_del_relay),
+            version_del_relay: anterior.version_del_relay,
+            version_de_protocolo_minima: anterior.version_de_protocolo_minima,
+            version_de_protocolo_maxima: anterior.version_de_protocolo_maxima,
+            publicado_en: now,
+            estado: en_servicio
+        )
+        DespliegueEnServicio(version_del_relay: anterior.version_del_relay)
+
+    @guidance
+        -- Revertir es publicar de nuevo una versión conocida, no restaurar
+        -- estado: el estado de control de las instalaciones no se toca.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UnSoloDespliegueEnServicio {
+    for a in Despliegues:
+        for b in Despliegues:
+            a != b and a.estado = en_servicio implies b.estado = retirado
+}
+
+invariant DespliegueAdmiteAlMenosUnaVersion {
+    for d in Despliegues:
+        d.version_de_protocolo_maxima >= d.version_de_protocolo_minima
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Operador {
+    identified_by: OperadorDeMediaFranca where tiene_acceso_operacional
+}
+
+actor ConectorDesktop {
+    identified_by: enlace/Instalacion where estado in {conectada, desconectada}
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface SaludDelServicio {
+    -- Lo que MediaFranca ve para operar. Salud del despliegue, nunca estado
+    -- de las memorias de las personas.
+    facing operador: Operador
+
+    let despliegues_activos = Despliegues where estado = en_servicio
+
+    exposes:
+        servicio.estado
+        servicio.desde
+        servicio.motivo
+        for despliegue in despliegues_activos:
+            despliegue.version_del_relay
+            despliegue.version_de_protocolo_minima
+            despliegue.version_de_protocolo_maxima
+            despliegue.publicado_en
+
+    provides:
+        OperadorDeclaraDegradacion(operador, motivo)
+        OperadorDeclaraIncidenteDeConfidencialidad(operador, motivo)
+        OperadorRestableceServicio(operador)
+        OperadorPublicaDespliegue(operador, version_del_relay, version_minima, version_maxima)
+
+    related:
+        for despliegue in Despliegues where estado = retirado:
+            ReversionDeDespliegue(despliegue)
+
+    @guarantee SaludSinContenido
+        -- La salud del despliegue no incluye estado de usuarios ni ninguna
+        -- señal derivada del contenido que atraviesa el relay.
+
+    @guarantee AutenticacionNoSeRelajaPorDisponibilidad
+        -- Ninguna acción de esta superficie puede aflojar la autenticación
+        -- para recuperar disponibilidad.
+}
+
+surface ReversionDeDespliegue {
+    -- Una versión retirada, vista como destino posible de un rollback.
+    facing operador: Operador
+
+    context despliegue: Despliegue where estado = retirado
+
+    exposes:
+        despliegue.version_del_relay
+        despliegue.version_de_protocolo_minima
+        despliegue.version_de_protocolo_maxima
+        despliegue.publicado_en
+        despliegue.retirado_en
+
+    provides:
+        OperadorRevierteDespliegue(operador, despliegue)
+
+    @guarantee ReversionNoTocaEstadoDeControl
+        -- Revertir el relay no altera instalaciones, secretos ni
+        -- autorizaciones: un rollback no reabre un acceso revocado.
+}
+
+surface EstadoVisibleDelServicio {
+    -- Lo que la persona propietaria debe poder distinguir. En el piloto lo
+    -- presenta Vera Desktop.
+    facing conector: ConectorDesktop
+
+    exposes:
+        conector.estado
+        conector.esta_disponible
+        servicio.estado
+
+    @guarantee EstadosNombrados
+        -- La interfaz distingue "Vera desconectada", "cliente no autorizado",
+        -- "servicio degradado", "cuota alcanzada" y "resultado incierto".
+        -- "Error de red" no es un estado admisible para una persona no
+        -- técnica.
+
+    @guarantee EscriturasSuspendidasSeDicen
+        -- Con las escrituras suspendidas, la persona ve el motivo y no una
+        -- operación que falla sin explicación.
+}
+
+surface CompatibilidadDeProtocolo {
+    -- Lo que el conector necesita saber para operar o para saber que debe
+    -- actualizarse.
+    facing conector: ConectorDesktop
+
+    context conexion: enlace/ConexionDeEnlace
+        where estado = activa and instalacion = conector
+
+    let despliegues_activos = Despliegues where estado = en_servicio
+
+    exposes:
+        conexion.version_negociada
+        conexion.identificador_efimero
+        conexion.abierta_en
+        for despliegue in despliegues_activos:
+            despliegue.version_de_protocolo_minima
+            despliegue.version_de_protocolo_maxima
+
+    @guarantee RechazoDeVersionExplicito
+        -- Un conector con versión fuera del rango admitido recibe un rechazo
+        -- que nombra la incompatibilidad. No se cierra el canal sin motivo ni
+        -- se deja al conector reintentando contra un rechazo opaco.
+
+    @guarantee CompatibilidadHaciaAtras
+        -- Un cambio de esquema mantiene admitida al menos la versión anterior
+        -- del conector durante el periodo declarado en configuración.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "¿Qué SLO puede sostener realmente el presupuesto del piloto? El 99,5 % mensual y el overhead p95 de 500 ms son objetivos declarados sin medición ni costo asociado."
+
+open question "¿La degradación se declara manualmente o se deriva de una señal medida? Hoy sólo existe la declaración del operador, lo que significa que un servicio degradado sin operador presente se ve como servicio normal."
+
+open question "¿Durante cuántas versiones debe mantenerse la compatibilidad hacia atrás del esquema de sobre? El valor de config dice una versión; nadie lo ha confirmado contra el ritmo real de publicación del conector."
+
+open question "¿Quién puede declarar un incidente de confidencialidad y con qué evidencia? Suspender escrituras es una acción destructiva para el producto y hoy no tiene ceremonia definida."
