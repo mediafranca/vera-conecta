@@ -1,8 +1,9 @@
 # Vera Conecta
 
-Vera Conecta será el puente opcional entre una instalación local de Vera y los
-clientes MCP que viven en Internet. La instalación inicia una conexión saliente;
-la persona no abre puertos, no administra una IP pública y no instala Tailscale.
+Vera Conecta será el puente opcional entre una instalación local de
+[Vera](https://github.com/mediafranca/vera) y los clientes MCP que viven en
+Internet. La instalación inicia una conexión saliente; la persona no abre
+puertos, no administra una IP pública y no instala Tailscale.
 
 ```text
 ChatGPT / Claude / otro cliente MCP
