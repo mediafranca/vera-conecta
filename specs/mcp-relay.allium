@@ -12,8 +12,16 @@
 --   - sesión MCP como continuidad de transporte;
 --   - entrega por el canal de enlace y acuse de recibo del conector;
 --   - respuesta, plazo agotado, desconexión y resultado incierto;
+--   - plazos distintos para lectura y escritura, y su extensión automática
+--     mientras haya actividad de streaming;
 --   - reintento de lectura no acusada y no-reintento de escritura ambigua;
 --   - límites de concurrencia y tamaño visibles para el cliente.
+--
+-- Matriz de compatibilidad v1: el contrato de esta spec se prueba y se sostiene
+-- frente a MCP Inspector y Hermes, y frente a nadie más. Cualquier otro cliente
+-- (Claude, ChatGPT, los que vengan) es explícitamente experimental hasta que se
+-- pruebe: puede funcionar, pero no forma parte del contrato v1 y su fallo no es
+-- un incumplimiento de esta spec.
 --
 -- Excluye:
 --   - el contenido de las solicitudes y respuestas, que sólo atraviesa memoria
@@ -63,7 +71,9 @@ contract EntregaDeSobre {
 ------------------------------------------------------------
 
 enum ClaseDeOperacion {
-    -- La clase se deriva del método MCP, no de su contenido.
+    -- La clase se deriva del método MCP, no de su contenido. Un alcance
+    -- delete es de clase escritura para todos los efectos de esta spec:
+    -- plazo, suspensión por incidente y prohibición de reintento.
     lectura | escritura
 }
 
@@ -88,7 +98,10 @@ enum CodigoPublico {
 
 entity SesionMcp {
     -- Continuidad de transporte, no continuidad de memoria: cerrar una sesión
-    -- no cambia nada en Vera.
+    -- no cambia nada en Vera. Por lo mismo, la sesión sobrevive a un
+    -- desplazamiento del enlace: que Vera Desktop reconecte con otra conexión
+    -- no obliga al cliente a renegociar nada. Lo único que puede cerrarla es
+    -- el fin del acceso del cliente o su propia decisión.
     instalacion: enlace/Instalacion
     cliente: concesiones/ClienteAutorizado
     identificador: String
@@ -143,7 +156,10 @@ entity SolicitudEnTransito {
 
     invariant EscrituraAmbiguaNoSeReintenta {
         -- Invariante fuerte del producto: ante una entrega ambigua, una
-        -- escritura no vuelve a salir del relay bajo ninguna condición.
+        -- escritura no vuelve a salir del relay bajo ninguna condición. El
+        -- único reintento del sistema es de lectura, una sola vez, y la
+        -- distinción no admite matices: reintentar es una decisión de clase,
+        -- no de circunstancia.
         clase = escritura implies reintentos = 0
     }
 }
@@ -153,8 +169,12 @@ entity SolicitudEnTransito {
 ------------------------------------------------------------
 
 config {
-    -- Límites iniciales del piloto.
+    -- Límites iniciales del piloto. El plazo no mide duración total sino
+    -- silencio: cada fragmento transmitido lo renueva.
     plazo_de_solicitud: Duration = 120.seconds
+    -- Una escritura puede pedirle a Vera local un trabajo largo. Su plazo es
+    -- propio y mucho mayor que el del resto de las solicitudes.
+    plazo_de_escritura: Duration = 15.minutes
     max_concurrentes_por_instalacion: Integer = 32
     max_concurrentes_por_cliente: Integer = 8
     bytes_maximos_por_solicitud: Integer = 10_485_760
@@ -203,6 +223,7 @@ rule CerrarSesionesAlTerminarElAcceso {
 
 rule AceptarSolicitudMcp {
     when: ClienteEnviaSolicitudMcp(instalacion, credencial, origen_admitido, clase, alcance_requerido, bytes, sesion?)
+    let plazo = if clase = escritura: config.plazo_de_escritura else: config.plazo_de_solicitud
     ensures: SolicitudEnTransito.created(
         instalacion: instalacion,
         cliente: cliente_por_credencial(instalacion, credencial),
@@ -213,7 +234,7 @@ rule AceptarSolicitudMcp {
         bytes: bytes,
         origen_admitido: origen_admitido,
         recibida_en: now,
-        plazo_en: now + config.plazo_de_solicitud,
+        plazo_en: now + plazo,
         acusada: false,
         reintentos: 0,
         estado: recibida
@@ -377,6 +398,22 @@ rule DesktopAcusaRecibo {
     ensures: solicitud.acusada = true
 }
 
+rule ActividadDeStreamingExtiendePlazo {
+    -- El plazo mide silencio, no duración total: mientras lleguen bytes o
+    -- eventos del conector, la solicitud sigue viva. La extensión es
+    -- automática y no exige ningún anuncio explícito del conector.
+    when: DesktopTransmiteFragmento(solicitud, bytes)
+    requires: solicitud.estado = entregada
+    let plazo =
+        if solicitud.clase = escritura: config.plazo_de_escritura
+        else: config.plazo_de_solicitud
+    ensures: solicitud.plazo_en = now + plazo
+
+    @guidance
+        -- Un fragmento vacío no es actividad. Lo que renueva el plazo es
+        -- progreso observable, no la mera existencia de una conexión abierta.
+}
+
 rule ResponderSolicitud {
     when: DesktopResponde(solicitud, conexion)
     requires: solicitud.estado = entregada
@@ -399,8 +436,10 @@ rule PlazoAgotadoTrasEntrega {
         SolicitudConcluida(solicitud: solicitud)
 
     @guidance
-        -- El plazo sólo se amplía por actividad de streaming explícita. Al
-        -- agotarse, el resultado es incierto, no fallido.
+        -- Llegar aquí significa silencio real: ningún fragmento durante todo
+        -- el plazo aplicable a la clase de la solicitud, 120 s para lecturas y
+        -- 15 minutos para escrituras. Al agotarse, el resultado es incierto,
+        -- no fallido.
 }
 
 rule SolicitudEntregadaQuedaIncierta {
@@ -431,9 +470,10 @@ rule SolicitudAutenticadaSinVera {
 }
 
 rule ReintentarLecturaNoAcusada {
-    -- Único reintento automático del sistema: una lectura que el conector
-    -- nunca acusó, sobre un enlace que acaba de ser desplazado por otra
-    -- conexión de la misma instalación.
+    -- Único reintento automático del sistema, y sólo para lecturas: una
+    -- lectura que el conector nunca acusó, sobre un enlace que acaba de ser
+    -- desplazado por otra conexión de la misma instalación. Una escritura en
+    -- esa misma situación termina en resultado incierto, sin excepción.
     when: enlace/EnlaceDesplazado(inst, identificador_efimero)
     for solicitud in SolicitudesEnTransito where estado = entregada:
         requires: solicitud.instalacion = inst
@@ -548,6 +588,12 @@ surface EndpointMcp {
     @guarantee SinFiltracionDeExistencia
         -- Los cuerpos no revelan si existe una página, una persona o una
         -- instalación más allá de lo que la credencial ya podría saber.
+
+    @guarantee MatrizDeCompatibilidadV1
+        -- El contrato v1 de esta superficie se sostiene frente a MCP Inspector
+        -- y Hermes. Cualquier otro cliente MCP es experimental hasta probarse:
+        -- su comportamiento no forma parte del contrato y su fallo no es un
+        -- incumplimiento.
 }
 
 surface ResultadoDeSolicitudMcp {
@@ -592,6 +638,7 @@ surface EntregaAlConector {
 
     provides:
         DesktopAcusaReciboDeSobre(solicitud)
+        DesktopTransmiteFragmento(solicitud, bytes)
         DesktopResponde(solicitud, solicitud.entregada_por)
 
     contracts:
@@ -602,6 +649,11 @@ surface EntregaAlConector {
         -- identidad derivada, alcances, plazo y medida. Nada más cruza, y
         -- nada de lo que cruza se conserva.
 
+    @guarantee PlazoQueMideSilencio
+        -- Mientras el conector transmita fragmentos, la solicitud no vence.
+        -- Una operación larga de Vera local no se corta por ser larga, sino
+        -- por dejar de dar señales.
+
     @guidance
         -- Los fragmentos del cuerpo viajan con un máximo por trozo para no
         -- retener cuerpos grandes en memoria del relay.
@@ -611,10 +663,5 @@ surface EntregaAlConector {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "¿Qué clientes MCP concretos forman la matriz de compatibilidad v1? Se prueba primero con MCP Inspector y Hermes; ChatGPT y Claude dependen de que su producto admita servidores MCP remotos, lo que no está verificado."
-
-open question "¿Un reintento de lectura no acusada es aceptable para el producto, o toda entrega ambigua debe terminar en resultado incierto sin excepción? El modelo actual permite un solo reintento y sólo tras un desplazamiento de enlace."
-
-open question "¿Qué debe ocurrir con una sesión MCP cuya instalación se reconecta con otra conexión? Hoy la sesión sobrevive al desplazamiento; podría exigirse renegociación."
-
-open question "¿El plazo de 120 s se amplía por actividad de streaming de forma automática o sólo ante un evento explícito del conector? La diferencia cambia el significado del código de plazo agotado."
+-- Sin preguntas abiertas: las decisiones del piloto sobre compatibilidad,
+-- reintento, sesión y plazos están tomadas y aplicadas arriba.
