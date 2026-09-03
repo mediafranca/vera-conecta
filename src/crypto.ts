@@ -27,6 +27,10 @@ export async function verifyWithPepper(pepper: string, value: string, expectedHa
   return timingSafeEqual(actual, expectedHash);
 }
 
+export function timingSafeEqualStrings(a: string, b: string): boolean {
+  return timingSafeEqual(a, b);
+}
+
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let mismatch = 0;

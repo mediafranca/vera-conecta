@@ -68,6 +68,38 @@ export default {
       );
     }
 
+    const clientsMatch = url.pathname.match(/^\/v\/([^/]+)\/clients$/);
+    if (clientsMatch && (request.method === "POST" || request.method === "GET")) {
+      const idPublico = decodeURIComponent(clientsMatch[1]);
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      if (request.method === "GET") {
+        return installation.fetch(new Request("http://do/internal/clients"));
+      }
+      const bodyText = await request.text();
+      return installation.fetch(
+        new Request("http://do/internal/clients", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText,
+        }),
+      );
+    }
+
+    const clientActionMatch = url.pathname.match(/^\/v\/([^/]+)\/clients\/([^/]+)\/(claim|revoke)$/);
+    if (request.method === "POST" && clientActionMatch) {
+      const idPublico = decodeURIComponent(clientActionMatch[1]);
+      const principalId = decodeURIComponent(clientActionMatch[2]);
+      const bodyText = await request.text();
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      return installation.fetch(
+        new Request(`http://do/internal/clients/${encodeURIComponent(principalId)}/${clientActionMatch[3]}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText,
+        }),
+      );
+    }
+
     return json(501, {
       error: "not_implemented",
       detail: "El relay permanece cerrado hasta que sus contratos estén especificados y probados.",

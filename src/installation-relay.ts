@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { hashWithPepper, randomToken, verifyWithPepper } from "./crypto";
+import { hashWithPepper, randomToken, timingSafeEqualStrings, verifyWithPepper } from "./crypto";
 
 export interface Env {
   INSTALLATIONS: DurableObjectNamespace<InstallationRelay>;
@@ -15,6 +15,15 @@ const BITS_ENTROPIA_SECRETO = 256;
 const VERSION_MINIMA_ADMITIDA = 1;
 const VERSION_MAXIMA_ADMITIDA = 1;
 const ALARM_TICK_MS = 15_000;
+
+// specs/client-grants.allium § config
+const VIGENCIA_DE_AUTORIZACION_PENDIENTE_MS = 15 * 60_000;
+const VIGENCIA_DE_CREDENCIAL_MS = 30 * 24 * 60 * 60_000;
+const BITS_ENTROPIA_CREDENCIAL = 256;
+const ALCANCES_VALIDOS = ["read", "write"] as const;
+type Alcance = (typeof ALCANCES_VALIDOS)[number];
+const EVIDENCIAS_VALIDAS = ["bearer_del_piloto", "confirmacion_en_desktop", "oauth_con_consentimiento_explicito"] as const;
+type Evidencia = (typeof EVIDENCIAS_VALIDAS)[number];
 
 function json(status: number, body: unknown): Response {
   return Response.json(body, { status, headers: { "cache-control": "no-store" } });
@@ -34,6 +43,14 @@ interface InstalacionRow extends Record<string, SqlStorageValue> {
 
 interface LinkAttachment {
   identificador_efimero: string;
+}
+
+interface ClienteRow extends Record<string, SqlStorageValue> {
+  principal_id: string;
+  etiqueta_de_aplicacion: string;
+  estado: "pendiente" | "autorizado" | "revocado" | "expirado";
+  creado_en: number;
+  expira_en: number | null;
 }
 
 export class InstallationRelay extends DurableObject<Env> {
@@ -75,6 +92,23 @@ export class InstallationRelay extends DurableObject<Env> {
       estado TEXT NOT NULL,
       cerrada_en INTEGER
     )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS clientes (
+      principal_id TEXT PRIMARY KEY,
+      etiqueta_de_aplicacion TEXT NOT NULL,
+      estado TEXT NOT NULL,
+      creado_en INTEGER NOT NULL,
+      expira_en INTEGER,
+      hash_de_credencial TEXT,
+      revocado_en INTEGER
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS concesiones (
+      cliente_principal_id TEXT PRIMARY KEY,
+      alcances TEXT NOT NULL,
+      otorgada_en INTEGER NOT NULL,
+      evidencia TEXT NOT NULL,
+      estado TEXT NOT NULL,
+      retirada_en INTEGER
+    )`);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -99,6 +133,20 @@ export class InstallationRelay extends DurableObject<Env> {
     }
     if (request.method === "POST" && url.pathname === "/internal/revoke") {
       return this.revocar(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/clients") {
+      return this.autorizarCliente(request);
+    }
+    if (request.method === "GET" && url.pathname === "/internal/clients") {
+      return this.listarClientes();
+    }
+    const claimClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/claim$/);
+    if (request.method === "POST" && claimClienteMatch) {
+      return this.reclamarCredencialDeCliente(request, claimClienteMatch[1]);
+    }
+    const revokeClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/revoke$/);
+    if (request.method === "POST" && revokeClienteMatch) {
+      return this.revocarCliente(request, revokeClienteMatch[1]);
     }
     return json(404, { error: "ruta_interna_desconocida" });
   }
@@ -318,19 +366,7 @@ export class InstallationRelay extends DurableObject<Env> {
     const body = (await request.json().catch(() => null)) as { prueba_de_secreto?: unknown } | null;
     const pruebaDeSecreto = body?.prueba_de_secreto;
     if (typeof pruebaDeSecreto !== "string" || pruebaDeSecreto.length === 0) return null;
-
-    const instalacion = this.leerInstalacion();
-    if (!instalacion) return null;
-
-    const secretosUtilizables = this.ctx.storage.sql
-      .exec<{ hash: string }>(`SELECT hash FROM secretos WHERE estado IN ('vigente', 'solapado')`)
-      .toArray();
-    for (const secreto of secretosUtilizables) {
-      if (await verifyWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, pruebaDeSecreto, secreto.hash)) {
-        return instalacion;
-      }
-    }
-    return null;
+    return this.verificarSecretoDeEnlace(pruebaDeSecreto);
   }
 
   // rule RotarSecretoDeEnlace
@@ -398,7 +434,219 @@ export class InstallationRelay extends DurableObject<Env> {
     );
     this.ctx.storage.sql.exec(`UPDATE conexiones SET estado = 'cerrada', cerrada_en = ? WHERE estado = 'activa'`, now);
 
+    // rules RevocarClientesPendientesAlRevocarInstalacion,
+    // RevocarClientesAutorizadosAlRevocarInstalacion — revocar la instalación
+    // arrastra a todos sus clientes, sin excepción.
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'revocado', revocado_en = ?, expira_en = NULL, hash_de_credencial = NULL
+       WHERE estado IN ('pendiente', 'autorizado')`,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE concesiones SET estado = 'retirada', retirada_en = ? WHERE estado = 'vigente'`,
+      now,
+    );
+
     return json(200, { ok: true });
+  }
+
+  // rule AutorizarCliente
+  private async autorizarCliente(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as {
+      prueba_de_secreto?: unknown;
+      etiqueta_de_aplicacion?: unknown;
+      alcances?: unknown;
+      evidencia?: unknown;
+    } | null;
+
+    const pruebaDeSecreto = body?.prueba_de_secreto;
+    if (typeof pruebaDeSecreto !== "string" || pruebaDeSecreto.length === 0) {
+      return json(401, { error: "credencial_de_enlace_invalida" });
+    }
+    const instalacion = await this.verificarSecretoDeEnlace(pruebaDeSecreto);
+    if (!instalacion) return json(401, { error: "credencial_de_enlace_invalida" });
+    if (instalacion.estado !== "conectada" && instalacion.estado !== "desconectada") {
+      return json(409, { error: "instalacion_no_permite_autorizar_clientes" });
+    }
+
+    const etiqueta = body?.etiqueta_de_aplicacion;
+    if (typeof etiqueta !== "string" || etiqueta.length === 0) {
+      return json(400, { error: "etiqueta_de_aplicacion_invalida" });
+    }
+    const alcances = this.validarAlcances(body?.alcances);
+    if (!alcances) return json(400, { error: "alcances_invalidos" });
+    const evidencia = this.validarEvidencia(body?.evidencia);
+    if (!evidencia) return json(400, { error: "evidencia_invalida" });
+
+    const now = Date.now();
+    const expiraEn = now + VIGENCIA_DE_AUTORIZACION_PENDIENTE_MS;
+    const principalId = randomToken(BITS_ENTROPIA_CREDENCIAL);
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO clientes (principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en)
+       VALUES (?, ?, 'pendiente', ?, ?)`,
+      principalId,
+      etiqueta,
+      now,
+      expiraEn,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO concesiones (cliente_principal_id, alcances, otorgada_en, evidencia, estado)
+       VALUES (?, ?, ?, ?, 'vigente')`,
+      principalId,
+      alcances.join(","),
+      now,
+      evidencia,
+    );
+    await this.scheduleNextAlarm();
+
+    return json(201, {
+      principal_id: principalId,
+      etiqueta_de_aplicacion: etiqueta,
+      alcances,
+      expira_en: new Date(expiraEn).toISOString(),
+    });
+  }
+
+  // rule EmitirCredencialDeCliente
+  private async reclamarCredencialDeCliente(request: Request, principalId: string): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as { prueba_de_consentimiento?: unknown } | null;
+    const pruebaDeConsentimiento = body?.prueba_de_consentimiento;
+    if (typeof pruebaDeConsentimiento !== "string" || !timingSafeEqualStrings(pruebaDeConsentimiento, principalId)) {
+      return json(401, { error: "consentimiento_invalido" });
+    }
+
+    const cliente = this.leerCliente(principalId);
+    if (!cliente) return json(404, { error: "cliente_no_encontrado" });
+    if (cliente.estado !== "pendiente") return json(409, { error: "cliente_no_esta_pendiente" });
+    if (!cliente.expira_en || cliente.expira_en <= Date.now()) {
+      return json(410, { error: "autorizacion_caducada" });
+    }
+
+    const now = Date.now();
+    const nuevaExpiracion = now + VIGENCIA_DE_CREDENCIAL_MS;
+    const secreto = randomToken(BITS_ENTROPIA_CREDENCIAL);
+    const hash = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secreto);
+
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'autorizado', hash_de_credencial = ?, expira_en = ? WHERE principal_id = ?`,
+      hash,
+      nuevaExpiracion,
+      principalId,
+    );
+    await this.scheduleNextAlarm();
+
+    const concesion = this.leerConcesion(principalId);
+    return json(201, {
+      secreto_de_cliente: secreto,
+      alcances: concesion?.alcances.split(",") ?? [],
+      expira_en: new Date(nuevaExpiracion).toISOString(),
+    });
+  }
+
+  // rules RevocarClientePendiente, RevocarClienteAutorizado
+  private async revocarCliente(request: Request, principalId: string): Promise<Response> {
+    const instalacion = await this.leerCredencialDesdeBody(request);
+    if (!instalacion) return json(401, { error: "credencial_de_enlace_invalida" });
+
+    const cliente = this.leerCliente(principalId);
+    if (!cliente) return json(404, { error: "cliente_no_encontrado" });
+    if (cliente.estado !== "pendiente" && cliente.estado !== "autorizado") {
+      return json(409, { error: "cliente_no_revocable" });
+    }
+
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'revocado', revocado_en = ?, expira_en = NULL, hash_de_credencial = NULL
+       WHERE principal_id = ?`,
+      now,
+      principalId,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE concesiones SET estado = 'retirada', retirada_en = ? WHERE cliente_principal_id = ?`,
+      now,
+      principalId,
+    );
+
+    return json(200, { ok: true });
+  }
+
+  private async listarClientes(): Promise<Response> {
+    const clientes = this.ctx.storage.sql
+      .exec<ClienteRow>(`SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en FROM clientes`)
+      .toArray();
+    const concesiones = this.ctx.storage.sql
+      .exec<{ cliente_principal_id: string; alcances: string; evidencia: string }>(
+        `SELECT cliente_principal_id, alcances, evidencia FROM concesiones`,
+      )
+      .toArray();
+    const alcancesPorCliente = new Map(concesiones.map((c) => [c.cliente_principal_id, c]));
+
+    return json(200, {
+      clientes: clientes.map((c) => ({
+        principal_id: c.principal_id,
+        etiqueta_de_aplicacion: c.etiqueta_de_aplicacion,
+        estado: c.estado,
+        creado_en: new Date(c.creado_en).toISOString(),
+        alcances: alcancesPorCliente.get(c.principal_id)?.alcances.split(",") ?? [],
+        evidencia: alcancesPorCliente.get(c.principal_id)?.evidencia ?? null,
+      })),
+    });
+  }
+
+  private validarAlcances(valor: unknown): Alcance[] | null {
+    if (!Array.isArray(valor) || valor.length === 0) return null;
+    const alcances = new Set<Alcance>();
+    for (const item of valor) {
+      if (typeof item !== "string" || !(ALCANCES_VALIDOS as readonly string[]).includes(item)) return null;
+      alcances.add(item as Alcance);
+    }
+    return Array.from(alcances);
+  }
+
+  private validarEvidencia(valor: unknown): Evidencia | null {
+    if (typeof valor !== "string" || !(EVIDENCIAS_VALIDAS as readonly string[]).includes(valor)) return null;
+    return valor as Evidencia;
+  }
+
+  private leerCliente(principalId: string): ClienteRow | null {
+    return (
+      this.ctx.storage.sql
+        .exec<ClienteRow>(
+          `SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en FROM clientes WHERE principal_id = ?`,
+          principalId,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  private leerConcesion(principalId: string): { alcances: string } | null {
+    return (
+      this.ctx.storage.sql
+        .exec<{ alcances: string } & Record<string, SqlStorageValue>>(
+          `SELECT alcances FROM concesiones WHERE cliente_principal_id = ?`,
+          principalId,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  // Verifica posesión del secreto de enlace sin exigir el resto del cuerpo
+  // que espera leerCredencialDesdeBody (autorizarCliente ya extrajo su propio
+  // body con campos adicionales antes de llegar aquí).
+  private async verificarSecretoDeEnlace(pruebaDeSecreto: string): Promise<InstalacionRow | null> {
+    const instalacion = this.leerInstalacion();
+    if (!instalacion) return null;
+
+    const secretosUtilizables = this.ctx.storage.sql
+      .exec<{ hash: string }>(`SELECT hash FROM secretos WHERE estado IN ('vigente', 'solapado')`)
+      .toArray();
+    for (const secreto of secretosUtilizables) {
+      if (await verifyWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, pruebaDeSecreto, secreto.hash)) {
+        return instalacion;
+      }
+    }
+    return null;
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -512,6 +760,35 @@ export class InstallationRelay extends DurableObject<Env> {
       now,
     );
 
+    // rule AutorizacionPendienteCaduca
+    this.ctx.storage.sql.exec(
+      `UPDATE concesiones SET estado = 'retirada', retirada_en = ?
+       WHERE estado = 'vigente' AND cliente_principal_id IN (
+         SELECT principal_id FROM clientes WHERE estado = 'pendiente' AND expira_en <= ?
+       )`,
+      now,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'expirado', expira_en = NULL WHERE estado = 'pendiente' AND expira_en <= ?`,
+      now,
+    );
+
+    // rule CredencialDeClienteExpira
+    this.ctx.storage.sql.exec(
+      `UPDATE concesiones SET estado = 'retirada', retirada_en = ?
+       WHERE estado = 'vigente' AND cliente_principal_id IN (
+         SELECT principal_id FROM clientes WHERE estado = 'autorizado' AND expira_en <= ?
+       )`,
+      now,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE clientes SET estado = 'expirado', expira_en = NULL, hash_de_credencial = NULL
+       WHERE estado = 'autorizado' AND expira_en <= ?`,
+      now,
+    );
+
     await this.scheduleNextAlarm();
   }
 
@@ -527,7 +804,8 @@ export class InstallationRelay extends DurableObject<Env> {
       sql.exec(`SELECT 1 FROM desafios WHERE estado = 'pendiente' LIMIT 1`).toArray().length > 0 ||
       sql.exec(`SELECT 1 FROM instalacion WHERE estado = 'emparejando' LIMIT 1`).toArray().length > 0 ||
       sql.exec(`SELECT 1 FROM conexiones WHERE estado = 'activa' LIMIT 1`).toArray().length > 0 ||
-      sql.exec(`SELECT 1 FROM secretos WHERE estado = 'solapado' LIMIT 1`).toArray().length > 0;
+      sql.exec(`SELECT 1 FROM secretos WHERE estado = 'solapado' LIMIT 1`).toArray().length > 0 ||
+      sql.exec(`SELECT 1 FROM clientes WHERE estado IN ('pendiente', 'autorizado') LIMIT 1`).toArray().length > 0;
 
     if (hayPendientes) {
       await this.ctx.storage.setAlarm(Date.now() + ALARM_TICK_MS);
