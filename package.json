@@ -1,0 +1,23 @@
+{
+  "name": "vera-conecta",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Relay soberano entre clientes MCP remotos y Vera Desktop",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env=\"\"",
+    "dry-run": "wrangler deploy --env=\"\" --dry-run --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260902.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.128.0"
+  }
+}

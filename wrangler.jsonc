@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vera-conecta",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "conecta.mediafranca.net",
+      "custom_domain": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "INSTALLATIONS",
+        "class_name": "InstallationRelay"
+      }
+    ]
+  },
+  "exports": {
+    "InstallationRelay": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "observability": {
+    "enabled": false
+  },
+  "env": {
+    "staging": {
+      "name": "vera-conecta-staging",
+      "workers_dev": true,
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "INSTALLATIONS",
+            "class_name": "InstallationRelay"
+          }
+        ]
+      }
+    }
+  }
+}
