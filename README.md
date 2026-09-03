@@ -36,12 +36,22 @@ Probado extremo a extremo, sin memoria real:
 - `client-grants.allium`: autorizar un cliente MCP por instalación, que reclame
   su credencial propia, y revocarlo — individualmente o en cascada al revocar la
   instalación completa.
+- `mcp-relay.allium`: `POST /v/:id/mcp` acepta, clasifica, entrega por el enlace
+  activo y resuelve una solicitud MCP (respuesta, plazo agotado, Vera
+  desconectada, reintento de lectura no acusada o conflicto de enlace tras un
+  desplazamiento). Sesión MCP vía `Mcp-Session-Id`, abierta implícitamente por
+  el primer POST y cerrada por `DELETE` o por el fin del acceso del cliente.
+  Dos simplificaciones deliberadas: el transporte es petición/respuesta en un
+  solo tramo, no streaming HTTP real; y la clasificación método MCP →
+  clase/alcance es una decisión de implementación (lectura para
+  descubrimiento/protocolo, escritura por defecto para el resto, empezando por
+  `tools/call`), no algo que la spec resuelva.
 
-Nada de esto todavía toca MCP en sí ni el grafo de Vera: sigue faltando
-`mcp-relay.allium`, el endpoint `/v/:id/mcp` que un cliente MCP remoto (Claude,
-Codex, etc.) usaría de verdad con la credencial que emite client-grants. `/health`
-responde; las rutas que aún no tienen contrato probado (MCP, OAuth) contestan
-`501` deliberadamente.
+`service-operations.allium` y `privacy-and-audit.allium` siguen sin
+implementar, salvo el interruptor manual `escrituras_admitidas`
+(`POST /v/:id/servicio`) que `mcp-relay` necesita — la degradación automática
+por umbral sigue siendo la pregunta abierta de esa spec. `/health` responde;
+OAuth (`client-grants` usa bearer del piloto) sigue fuera de alcance hasta M4.
 
 No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
 la suite sobre `@cloudflare/vitest-pool-workers`.
