@@ -15,9 +15,15 @@
     "check": "npm run typecheck && npm test && npm run dry-run"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260902.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.128.0"
+  },
+  "allowScripts": {
+    "workerd@1.20260815.1": true,
+    "workerd@1.20260831.1": true,
+    "esbuild@0.28.1": true
   }
 }
