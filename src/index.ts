@@ -105,6 +105,28 @@ export default {
       );
     }
 
+    const mcpMatch = url.pathname.match(/^\/v\/([^/]+)\/mcp$/);
+    if (mcpMatch && (request.method === "POST" || request.method === "DELETE")) {
+      const idPublico = decodeURIComponent(mcpMatch[1]);
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      const target = new URL("http://do/internal/mcp");
+      return installation.fetch(new Request(target, request));
+    }
+
+    const servicioMatch = url.pathname.match(/^\/v\/([^/]+)\/servicio$/);
+    if (request.method === "POST" && servicioMatch) {
+      const idPublico = decodeURIComponent(servicioMatch[1]);
+      const bodyText = await request.text();
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      return installation.fetch(
+        new Request("http://do/internal/servicio", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText,
+        }),
+      );
+    }
+
     return json(501, {
       error: "not_implemented",
       detail: "El relay permanece cerrado hasta que sus contratos estén especificados y probados.",
