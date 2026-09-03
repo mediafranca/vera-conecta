@@ -1,4 +1,5 @@
 import { InstallationRelay, type Env } from "./installation-relay";
+import { landingResponse } from "./landing";
 
 export type { Env };
 export { InstallationRelay };
@@ -15,6 +16,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return json(200, { service: "vera-conecta", status: "design-skeleton" });
+    }
+
+    if (request.method === "GET" && url.pathname === "/") {
+      return landingResponse();
     }
 
     if (request.method === "POST" && url.pathname === "/pairings") {
