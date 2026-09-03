@@ -22,17 +22,26 @@ https://conecta.mediafranca.net/v/<id-publico>/mcp
 
 ## Estado
 
-**M0 completo, M1 en curso.** Las cinco specs Allium (`specs/*.allium`) fijan el
-contrato; cada una deja preguntas abiertas explícitas todavía sin decidir.
+**M0 completo, M1 casi completo.** Las cinco specs Allium (`specs/*.allium`) fijan
+el contrato; cada una deja preguntas abiertas explícitas todavía sin decidir.
 
-El canal de enlace de `installation-link.allium` es el primer walking skeleton
-probado extremo a extremo, sin memoria real: emparejamiento de un solo uso,
-apertura del canal WebSocket hibernable, latido, desplazamiento de conexión,
-revocación por silencio o abandono, y un eco correlacionado por `request_id`
-que demuestra transporte de solicitud/respuesta. Nada de esto todavía toca
-MCP ni el grafo de Vera. `/health` responde; las rutas de producto que aún no
-tienen contrato probado (MCP, OAuth, control de instalación) contestan `501`
-deliberadamente.
+Probado extremo a extremo, sin memoria real:
+
+- `installation-link.allium`: emparejamiento de un solo uso, apertura del canal
+  WebSocket hibernable, latido, desplazamiento de conexión, revocación por
+  silencio o abandono, rotación de secreto y revocación de la instalación. Falta
+  sólo `DesktopRegeneraIdPublico`, aplazada porque exige migrar estado entre
+  Durable Objects y la propia spec no resuelve si conserva las autorizaciones de
+  cliente.
+- `client-grants.allium`: autorizar un cliente MCP por instalación, que reclame
+  su credencial propia, y revocarlo — individualmente o en cascada al revocar la
+  instalación completa.
+
+Nada de esto todavía toca MCP en sí ni el grafo de Vera: sigue faltando
+`mcp-relay.allium`, el endpoint `/v/:id/mcp` que un cliente MCP remoto (Claude,
+Codex, etc.) usaría de verdad con la credencial que emite client-grants. `/health`
+responde; las rutas que aún no tienen contrato probado (MCP, OAuth) contestan
+`501` deliberadamente.
 
 No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
 la suite sobre `@cloudflare/vitest-pool-workers`.
