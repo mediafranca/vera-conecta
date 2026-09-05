@@ -83,6 +83,14 @@ function solicitudMcp(idPublico: string, secreto: string, metodo = "tools/list",
   });
 }
 
+function llamadaDeHerramienta(idPublico: string, secreto: string, nombre: string): Promise<Response> {
+  return SELF.fetch(`https://vera-conecta.test/v/${idPublico}/mcp`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${secreto}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: nombre, arguments: {} } }),
+  });
+}
+
 describe("aceptación de una solicitud MCP", () => {
   it("entrega una lectura por el enlace y responde con lo que Desktop contesta", async () => {
     const { id_publico, desktop, credencial } = await instalacionConectadaYCliente(["read"]);
@@ -92,6 +100,8 @@ describe("aceptación de una solicitud MCP", () => {
     expect(sobre.tipo).toBe("sobre");
     expect(sobre.clase).toBe("lectura");
     expect(sobre.alcance).toBe("read");
+    expect(sobre.principal_id).toBeTypeOf("string");
+    expect(sobre.alcances).toEqual(["read"]);
 
     desktop.send(JSON.stringify({ tipo: "sobre_acuse", request_id: sobre.request_id }));
     desktop.send(
@@ -114,6 +124,25 @@ describe("aceptación de una solicitud MCP", () => {
 
     desktop.send(JSON.stringify({ tipo: "sobre_respuesta", request_id: sobre.request_id, payload: {} }));
     await respuestaPromise;
+  });
+
+  it("permite una herramienta Vera conocida de lectura a un cliente read", async () => {
+    const { id_publico, desktop, credencial } = await instalacionConectadaYCliente(["read"]);
+
+    const respuestaPromise = llamadaDeHerramienta(id_publico, credencial.secreto_de_cliente, "vera_buscar");
+    const sobre = await esperarMensaje(desktop);
+    expect(sobre.clase).toBe("lectura");
+    expect(sobre.alcance).toBe("read");
+
+    desktop.send(JSON.stringify({ tipo: "sobre_respuesta", request_id: sobre.request_id, payload: { resultado: "ok" } }));
+    expect((await respuestaPromise).status).toBe(200);
+  });
+
+  it("trata una herramienta desconocida como escritura y no amplía un cliente read", async () => {
+    const { id_publico, credencial } = await instalacionConectadaYCliente(["read"]);
+    const respuesta = await llamadaDeHerramienta(id_publico, credencial.secreto_de_cliente, "vera_herramienta_futura");
+    expect(respuesta.status).toBe(403);
+    expect((await respuesta.json())).toMatchObject({ codigo: "sin_alcance" });
   });
 
   it("rechaza sin credencial con no_autenticada", async () => {

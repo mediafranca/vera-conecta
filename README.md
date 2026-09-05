@@ -22,7 +22,7 @@ https://conecta.mediafranca.net/v/<id-publico>/mcp
 
 ## Estado
 
-**M0 completo, M1 casi completo.** Las cinco specs Allium (`specs/*.allium`) fijan
+**M0 completo, M1 casi completo y primer corte de M2 probado localmente.** Las cinco specs Allium (`specs/*.allium`) fijan
 el contrato; cada una deja preguntas abiertas explícitas todavía sin decidir.
 
 Probado extremo a extremo, sin memoria real:
@@ -52,6 +52,17 @@ implementar, salvo el interruptor manual `escrituras_admitidas`
 (`POST /v/:id/servicio`) que `mcp-relay` necesita — la degradación automática
 por umbral sigue siendo la pregunta abierta de esa spec. `/health` responde;
 OAuth (`client-grants` usa bearer del piloto) sigue fuera de alcance hasta M4.
+
+El primer corte M2 conecta el relay local con la puerta MCP real de Vera: el
+catálogo y una llamada de lectura (`vera_buscar`) recorren cliente → relay →
+WebSocket saliente → conector Desktop → Vera y vuelven como JSON-RPC. El
+conector acusa antes de ejecutar, mantiene latidos y resuelve localmente la
+credencial correspondiente a la identidad y alcances derivados por el relay.
+Una herramienta desconocida se clasifica como escritura y nunca amplía una
+concesión `read`.
+
+Todavía faltan integración con el ciclo de vida de Vera Desktop, streaming HTTP
+real y una prueba desde otro equipo contra staging. No se declara M2 completo.
 
 No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
 la suite sobre `@cloudflare/vitest-pool-workers`.

@@ -71,9 +71,12 @@ contract EntregaDeSobre {
 ------------------------------------------------------------
 
 enum ClaseDeOperacion {
-    -- La clase se deriva del método MCP, no de su contenido. Un alcance
-    -- delete es de clase escritura para todos los efectos de esta spec:
-    -- plazo, suspensión por incidente y prohibición de reintento.
+    -- La clase se deriva del método MCP y, para tools/call, de la identidad
+    -- de la herramienta invocada. Nunca se deriva de sus argumentos. Una
+    -- herramienta desconocida se trata como escritura: el desconocimiento no
+    -- puede ampliar permisos. Un alcance delete es de clase escritura para
+    -- todos los efectos de esta spec: plazo, suspensión por incidente y
+    -- prohibición de reintento.
     lectura | escritura
 }
 
@@ -244,7 +247,9 @@ rule AceptarSolicitudMcp {
         -- La credencial presentada se resuelve aquí y no se conserva: el
         -- sobre lleva la identidad derivada del cliente, jamás el bearer.
         -- Los fragmentos del cuerpo se transmiten en streaming; el tamaño se
-        -- comprueba antes de deserializar.
+        -- comprueba antes de deserializar. Para tools/call se inspecciona sólo
+        -- params.name con el fin de clasificar la operación; los argumentos
+        -- no se usan para autorizar ni se conservan en el relay.
 }
 
 rule RechazarPorTamano {
@@ -630,6 +635,8 @@ surface EntregaAlConector {
 
     exposes:
         solicitud.request_id
+        solicitud.cliente
+        solicitud.cliente.concesion.alcances
         solicitud.clase
         solicitud.alcance_requerido
         solicitud.bytes

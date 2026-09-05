@@ -61,13 +61,9 @@ const CODIGO_HTTP: Record<CodigoPublico, number> = {
 };
 
 // Métodos MCP de sólo lectura por convención del protocolo (discovery,
-// negociación, notificaciones). El relay no inspecciona el contenido de la
-// solicitud (specs/mcp-relay.allium lo excluye explícitamente), así que
-// cualquier método no reconocido —empezando por tools/call, cuyo efecto real
-// el relay no puede conocer sin mirar dentro— se clasifica como escritura por
-// defecto. Es una decisión de implementación, no una decisión de la spec:
-// conviene revisarla si aparecen herramientas de sólo lectura que deban
-// clasificarse aparte.
+// negociación, notificaciones). Para tools/call se inspecciona únicamente la
+// identidad de la herramienta, nunca sus argumentos; desconocer una
+// herramienta no puede ampliar permisos y por eso cae a escritura.
 const METODOS_MCP_DE_LECTURA = new Set([
   "initialize",
   "ping",
@@ -83,8 +79,22 @@ const METODOS_MCP_DE_LECTURA = new Set([
   "logging/setLevel",
 ]);
 
-function clasificarMetodoMcp(metodo: string): { clase: ClaseDeOperacion; alcance: Alcance } {
+const HERRAMIENTAS_VERA_DE_LECTURA = new Set([
+  "vera_quien_soy",
+  "vera_buscar",
+  "vera_leer_pagina",
+  "vera_historia_bloque",
+  "vera_vecindario",
+  "vera_indice",
+  "vera_preparar_escritura",
+  "vera_ontologia",
+]);
+
+function clasificarMetodoMcp(metodo: string, herramienta?: string): { clase: ClaseDeOperacion; alcance: Alcance } {
   if (metodo.startsWith("notifications/") || METODOS_MCP_DE_LECTURA.has(metodo)) {
+    return { clase: "lectura", alcance: "read" };
+  }
+  if (metodo === "tools/call" && herramienta !== undefined && HERRAMIENTAS_VERA_DE_LECTURA.has(herramienta)) {
     return { clase: "lectura", alcance: "read" };
   }
   return { clase: "escritura", alcance: "write" };
@@ -872,14 +882,15 @@ export class InstallationRelay extends DurableObject<Env> {
       return this.respuestaMcpRechazada("no_autenticada");
     }
 
-    let cuerpo: { method?: unknown } | null;
+    let cuerpo: { method?: unknown; params?: { name?: unknown } } | null;
     try {
-      cuerpo = bodyText.length > 0 ? (JSON.parse(bodyText) as { method?: unknown }) : null;
+      cuerpo = bodyText.length > 0 ? (JSON.parse(bodyText) as { method?: unknown; params?: { name?: unknown } }) : null;
     } catch {
       cuerpo = null;
     }
     const metodo = typeof cuerpo?.method === "string" ? cuerpo.method : "";
-    const { clase, alcance } = clasificarMetodoMcp(metodo);
+    const herramienta = typeof cuerpo?.params?.name === "string" ? cuerpo.params.name : undefined;
+    const { clase, alcance } = clasificarMetodoMcp(metodo, herramienta);
 
     const concesion = this.leerConcesion(cliente.principal_id);
     const alcancesConcedidos = (concesion?.alcances.split(",") ?? []) as Alcance[];
@@ -965,6 +976,8 @@ export class InstallationRelay extends DurableObject<Env> {
         JSON.stringify({
           tipo: "sobre",
           request_id: requestId,
+          principal_id: datos.clienteId,
+          alcances: this.leerConcesion(datos.clienteId)?.alcances.split(",") ?? [],
           sesion: datos.sesionIdentificador,
           alcance: datos.alcance,
           clase: datos.clase,
