@@ -2,9 +2,10 @@
 
 ## En una frase
 
-Vera Conecta permite que un cliente MCP remoto llegue, con autorización
-revocable, a una instalación local de Vera mediante una conexión saliente que
-Vera Desktop mantiene hacia un relay administrado por MediaFranca.
+Vera Conecta permite que clientes remotos autorizados —agentes MCP o
+aplicaciones estrechas como Vera Clip— lleguen a una instalación local de Vera
+mediante una conexión saliente que Vera mantiene hacia un relay administrado
+por MediaFranca.
 
 ## Problema
 
@@ -19,6 +20,7 @@ Vera. Vera Conecta ofrece una puerta pública estable sin publicar toda Vera.
 - ID público opaco de instalación;
 - canal saliente persistente entre Desktop y el relay;
 - endpoint MCP remoto estable por instalación;
+- canal HTTP de captura para Vera Clip, separado del acceso MCP genérico;
 - credenciales separadas por cliente, revocables y con alcances;
 - transporte de solicitudes/respuestas MCP sin persistir su contenido;
 - estado visible: conectada, desconectada, degradada o revocada;
@@ -32,7 +34,8 @@ Vera. Vera Conecta ofrece una puerta pública estable sin publicar toda Vera.
 - publicar la interfaz humana privada de Vera;
 - sincronizar dos instalaciones Vera;
 - editar el grafo por una ruta distinta de las operaciones canónicas de Vera;
-- garantizar compatibilidad con una aplicación que no admita MCP remoto;
+- convertir el relay en una API general para cualquier aplicación;
+- garantizar compatibilidad MCP con una aplicación que no admita MCP remoto;
 - pagos, planes comerciales y administración multi-organización en el MVP.
 
 ## Principios no negociables

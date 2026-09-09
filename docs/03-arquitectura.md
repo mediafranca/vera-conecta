@@ -26,6 +26,13 @@ backoff, almacena secretos en Keychain/Credential Manager/libsecret, convierte
 sobres del relay en llamadas MCP a `127.0.0.1` y aplica la identidad Vera local.
 Nunca escucha una interfaz pública.
 
+Aunque hoy el conector, Vera y Cotito pueden convivir en una misma máquina,
+son responsabilidades separadas. Una instancia Vera puede ejecutarse en un
+equipo personal o en un anfitrión independiente sin cambiar el contrato del
+relay: sólo debe mantener el enlace saliente y exponer localmente las puertas
+canónicas que correspondan. Cotito es un participante de esa instancia, no una
+pieza de Vera Conecta.
+
 ## Rutas previstas
 
 - `GET /health`: salud del despliegue, sin estado de usuarios.
@@ -33,6 +40,9 @@ Nunca escucha una interfaz pública.
 - `POST /pairings/:code/claim`: reclama una sola vez.
 - `GET /v/:installation/link`: upgrade WebSocket autenticado de Desktop.
 - `POST|GET|DELETE /v/:installation/mcp`: Streamable HTTP MCP.
+- `POST /v/:installation/captures`: depósito estrecho de Vera Clip; autentica
+  una credencial con alcance `capture`, transmite el sobre por el mismo enlace
+  y nunca concede lectura del grafo ni operaciones arbitrarias.
 - `/.well-known/oauth-authorization-server`: metadatos OAuth.
 - `/.well-known/oauth-protected-resource`: metadatos del recurso MCP.
 - `/authorize`, `/token`, `/register`: OAuth cuando se habilite.

@@ -25,6 +25,19 @@ La conexión Desktop presenta:
 El relay responde con versión negociada, heartbeat y límites. El Durable Object
 usa la API hibernable (`acceptWebSocket`), no listeners WebSocket ordinarios.
 
+## Capturas de Vera Clip
+
+`POST /v/:installation/captures` transporta una captura confirmada hacia la
+puerta canónica de captura de Vera. No es MCP y no acepta operaciones genéricas
+del grafo. La credencial sólo autoriza el alcance `capture`; Vera vuelve a
+validar tamaño, forma, procedencia e idempotencia antes de escribir.
+
+El relay no conserva una captura cuando Vera está desconectada. Devuelve
+`503 vera_offline` y Vera Clip mantiene localmente la copia pendiente para un
+reintento posterior. Después de entregar el sobre, una caída anterior al acuse
+produce un resultado incierto: el cliente puede reintentar con la misma clave
+de idempotencia, nunca fabricar una segunda captura con otra identidad.
+
 ## Sobre interno
 
 Cada solicitud lleva sólo:

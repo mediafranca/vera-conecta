@@ -46,6 +46,10 @@ Probado extremo a extremo, sin memoria real:
   clase/alcance es una decisión de implementación (lectura para
   descubrimiento/protocolo, escritura por defecto para el resto, empezando por
   `tools/call`), no algo que la spec resuelva.
+- `capture-relay.allium`: especifica `POST /v/:id/captures` para transportar
+  capturas de [Vera Clip](https://github.com/mediafranca/vera-clip) con una
+  credencial limitada a `capture`, sin lectura del grafo, operaciones genéricas
+  ni cola remota. Todavía no está implementado.
 
 `service-operations.allium` y `privacy-and-audit.allium` siguen sin
 implementar, salvo el interruptor manual `escrituras_admitidas`
@@ -70,6 +74,7 @@ la suite sobre `@cloudflare/vitest-pool-workers`.
 ## Dirección acordada
 
 - Producto: **Vera Conecta**.
+- Esquema: [`docs/arquitectura-vera-conecta.html`](docs/arquitectura-vera-conecta.html).
 - Repositorio: `vera-conecta`.
 - Producción: `https://conecta.mediafranca.net`.
 - MCP por instalación: `https://conecta.mediafranca.net/v/<id-publico>/mcp`.
