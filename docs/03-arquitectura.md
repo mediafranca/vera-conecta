@@ -26,6 +26,41 @@ backoff, almacena secretos en Keychain/Credential Manager/libsecret, convierte
 sobres del relay en llamadas MCP a `127.0.0.1` y aplica la identidad Vera local.
 Nunca escucha una interfaz pública.
 
+El límite entre ambos repositorios queda fijado por este recorrido:
+
+```mermaid
+sequenceDiagram
+    actor D as Dueño de la biblioteca
+    participant UI as VERA: Conexiones
+    participant Desktop as Vera Desktop
+    participant Seguro as Almacén seguro del SO
+    participant Relay as Vera Conecta
+    participant MCP as Puerta MCP local
+    participant G as Grafo soberano
+
+    D->>UI: activa y empareja Vera Conecta
+    UI->>Desktop: solicita emparejamiento
+    Desktop->>Relay: reclama desafío de un solo uso
+    Relay-->>Desktop: id público + secreto de enlace
+    Desktop->>Seguro: cifra y guarda el secreto
+    Desktop->>Relay: abre WebSocket saliente
+    Relay-->>Desktop: solicitud con identidad y alcances
+    Desktop->>MCP: traduce a credencial local revocable
+    MCP->>G: ejecuta bajo la autoridad de VERA
+    G-->>MCP: resultado con procedencia
+    MCP-->>Desktop: respuesta local
+    Desktop-->>Relay: respuesta correlacionada
+    UI-->>D: estado, clientes, alcances y revocación
+
+    Note over Relay,G: El relay no conserva páginas, bloques, prompts ni respuestas
+```
+
+La implementación del ciclo de vida, la custodia del secreto y la traducción a
+credenciales locales vive en `mediafranca/vera`. Este repositorio conserva el
+contrato de red, el Worker, los Durable Objects y sus simuladores. Un cambio en
+los sobres o en el emparejamiento exige actualizar y probar ambos lados antes de
+declarar compatible una versión del protocolo.
+
 Aunque hoy el conector, Vera y Cotito pueden convivir en una misma máquina,
 son responsabilidades separadas. Una instancia Vera puede ejecutarse en un
 equipo personal o en un anfitrión independiente sin cambiar el contrato del

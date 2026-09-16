@@ -73,6 +73,13 @@ una caída con *backoff* exponencial y *jitter*, y cancela enlace y temporizador
 al apagarse. Esta pieza está probada como biblioteca; todavía falta incorporarla
 al arranque y cierre efectivos de Vera Desktop.
 
+La frontera y el recorrido completo se mantienen en el diagrama Mermaid de
+[`docs/03-arquitectura.md`](docs/03-arquitectura.md#conector-de-vera-desktop).
+El conector definitivo vive en el repositorio de VERA; Vera Conecta conserva el
+contrato del relay y sus simuladores. Ningún lado puede declararse compatible
+por separado: una versión de protocolo sólo se publica después de probar el
+recorrido Desktop → relay → puerta local → Desktop.
+
 Todavía faltan la incorporación del supervisor al ciclo de vida efectivo de
 Vera Desktop, streaming HTTP real y una prueba desde otro equipo contra staging.
 No se declara M2 completo.
