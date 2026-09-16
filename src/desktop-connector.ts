@@ -7,6 +7,14 @@ export interface RelayEnvelope {
   cuerpo: string;
 }
 
+export interface RelayCaptureEnvelope {
+  tipo: "captura";
+  request_id: string;
+  principal_id: string;
+  identificador_de_idempotencia: string;
+  cuerpo: string;
+}
+
 export interface LocalCredential {
   token: string;
   client: string;
@@ -14,8 +22,40 @@ export interface LocalCredential {
 
 export interface ConnectorDependencies {
   localMcpUrl: string;
+  localCaptureUrl?: string;
   credentialFor(principalId: string, scopes: readonly string[]): Promise<LocalCredential | null>;
   fetch?: typeof fetch;
+}
+
+export async function forwardCaptureEnvelope(
+  socket: RelaySocket,
+  envelope: RelayCaptureEnvelope,
+  dependencies: ConnectorDependencies,
+): Promise<void> {
+  const credential = await dependencies.credentialFor(envelope.principal_id, ["capture"]);
+  if (credential === null || !dependencies.localCaptureUrl) {
+    socket.send(JSON.stringify({ tipo: "captura_rechazada", request_id: envelope.request_id, payload: { codigo: "acceso_retirado" } }));
+    return;
+  }
+  try {
+    const response = await (dependencies.fetch ?? fetch)(dependencies.localCaptureUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${credential.token}`,
+        "x-vera-client": credential.client,
+        "content-type": "application/json",
+      },
+      body: envelope.cuerpo,
+    });
+    const payload = await response.json().catch(() => ({ aceptada: response.ok }));
+    socket.send(JSON.stringify({
+      tipo: response.ok ? "captura_aceptada" : "captura_rechazada",
+      request_id: envelope.request_id,
+      payload,
+    }));
+  } catch {
+    socket.send(JSON.stringify({ tipo: "captura_rechazada", request_id: envelope.request_id, payload: { codigo: "vera_no_disponible" } }));
+  }
 }
 
 export interface RelaySocket {
@@ -97,6 +137,16 @@ export function isRelayEnvelope(value: unknown): value is RelayEnvelope {
     && typeof candidate.cuerpo === "string";
 }
 
+export function isRelayCaptureEnvelope(value: unknown): value is RelayCaptureEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<RelayCaptureEnvelope>;
+  return candidate.tipo === "captura"
+    && typeof candidate.request_id === "string"
+    && typeof candidate.principal_id === "string"
+    && typeof candidate.identificador_de_idempotencia === "string"
+    && typeof candidate.cuerpo === "string";
+}
+
 export function connectDesktop(options: DesktopLinkOptions): DesktopLink {
   const url = new URL(`/v/${encodeURIComponent(options.installationId)}/link`, options.relayUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -120,6 +170,7 @@ export function connectDesktop(options: DesktopLinkOptions): DesktopLink {
       return;
     }
     if (isRelayEnvelope(parsed)) void forwardRelayEnvelope(socket, parsed, options);
+    if (isRelayCaptureEnvelope(parsed)) void forwardCaptureEnvelope(socket, parsed, options);
   });
   const clearHeartbeat = (): void => {
     if (heartbeat !== null) clearInterval(heartbeat);

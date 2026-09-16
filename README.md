@@ -46,10 +46,12 @@ Probado extremo a extremo, sin memoria real:
   clase/alcance es una decisión de implementación (lectura para
   descubrimiento/protocolo, escritura por defecto para el resto, empezando por
   `tools/call`), no algo que la spec resuelva.
-- `capture-relay.allium`: especifica `POST /v/:id/captures` para transportar
+- `capture-relay.allium`: `POST /v/:id/captures` ya transporta
   capturas de [Vera Clip](https://github.com/mediafranca/vera-clip) con una
   credencial limitada a `capture`, sin lectura del grafo, operaciones genéricas
-  ni cola remota. Todavía no está implementado.
+  ni cola remota. El conector Desktop las entrega a la puerta local de Vera y
+  devuelve aceptación, rechazo o resultado incierto sin persistir el contenido
+  en el relay.
 
 `service-operations.allium` y `privacy-and-audit.allium` siguen sin
 implementar, salvo el interruptor manual `escrituras_admitidas`

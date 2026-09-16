@@ -113,6 +113,13 @@ export default {
       return installation.fetch(new Request(target, request));
     }
 
+    const capturesMatch = url.pathname.match(/^\/v\/([^/]+)\/captures$/);
+    if (request.method === "POST" && capturesMatch) {
+      const idPublico = decodeURIComponent(capturesMatch[1]);
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      return installation.fetch(new Request("http://do/internal/captures", request));
+    }
+
     const servicioMatch = url.pathname.match(/^\/v\/([^/]+)\/servicio$/);
     if (request.method === "POST" && servicioMatch) {
       const idPublico = decodeURIComponent(servicioMatch[1]);

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { connectDesktop, forwardRelayEnvelope, type RelayEnvelope } from "../src/desktop-connector";
+import { connectDesktop, forwardCaptureEnvelope, forwardRelayEnvelope, type RelayEnvelope } from "../src/desktop-connector";
 
 const envelope = (overrides: Partial<RelayEnvelope> = {}): RelayEnvelope => ({
   tipo: "sobre",
@@ -98,5 +98,31 @@ describe("conector Desktop", () => {
       { url: "http://vera-b/mcp", authorization: "Bearer token-b" },
     ]));
     expect(calls).not.toContainEqual({ url: "http://vera-a/mcp", authorization: "Bearer token-b" });
+  });
+
+  it("entrega capturas a la puerta local con autoridad exclusiva de captura", async () => {
+    const sent: any[] = [];
+    const requestedScopes: Array<readonly string[]> = [];
+    const localFetch = vi.fn(async () => Response.json({ aceptada: true }, { status: 202 }));
+    await forwardCaptureEnvelope({ send: data => sent.push(JSON.parse(data)) }, {
+      tipo: "captura",
+      request_id: "capture-request",
+      principal_id: "clip-a",
+      identificador_de_idempotencia: "stable-capture",
+      cuerpo: JSON.stringify({ idempotencyKey: "stable-capture", content: "Texto" }),
+    }, {
+      localMcpUrl: "http://127.0.0.1:4173/mcp",
+      localCaptureUrl: "http://127.0.0.1:4173/captures",
+      credentialFor: async (_principal, scopes) => {
+        requestedScopes.push(scopes);
+        return { token: "capture-local", client: "vera-clip" };
+      },
+      fetch: localFetch,
+    });
+    expect(requestedScopes).toEqual([["capture"]]);
+    expect(localFetch).toHaveBeenCalledWith("http://127.0.0.1:4173/captures", expect.objectContaining({
+      headers: expect.objectContaining({ authorization: "Bearer capture-local" }),
+    }));
+    expect(sent).toContainEqual(expect.objectContaining({ tipo: "captura_aceptada", request_id: "capture-request" }));
   });
 });

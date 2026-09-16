@@ -21,7 +21,7 @@ const VIGENCIA_DE_AUTORIZACION_PENDIENTE_MS = 10 * 60_000;
 const VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS = 60 * 60_000;
 const VENTANA_DE_REFRESCO_MS = 90 * 24 * 60 * 60_000;
 const BITS_ENTROPIA_CREDENCIAL = 256;
-const ALCANCES_VALIDOS = ["read", "write", "delete"] as const;
+const ALCANCES_VALIDOS = ["read", "write", "delete", "capture"] as const;
 type Alcance = (typeof ALCANCES_VALIDOS)[number];
 const EVIDENCIAS_VALIDAS = ["bearer_del_piloto", "confirmacion_en_desktop", "oauth_con_consentimiento_explicito"] as const;
 type Evidencia = (typeof EVIDENCIAS_VALIDAS)[number];
@@ -35,6 +35,11 @@ const BYTES_MAXIMOS_POR_SOLICITUD = 10_485_760;
 const MAX_REINTENTOS_DE_LECTURA = 1;
 const BITS_ENTROPIA_REQUEST_ID = 128;
 const BITS_ENTROPIA_IDENTIFICADOR_DE_SESION = 128;
+
+// specs/capture-relay.allium: el sobre existe sólo mientras la petición HTTP
+// está en vuelo; no se guarda en SQL ni se registra su contenido.
+const BYTES_MAXIMOS_POR_CAPTURA = 2_000_000;
+const PLAZO_DE_CAPTURA_MS = 120_000;
 
 type ClaseDeOperacion = "lectura" | "escritura";
 type CodigoPublico =
@@ -153,6 +158,10 @@ interface SolicitudMcpPendiente {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface CapturaPendiente extends SolicitudMcpPendiente {
+  identificadorEfimero: string;
+}
+
 export class InstallationRelay extends DurableObject<Env> {
   // Correlaciona una solicitud MCP en vuelo con la Response HTTP que la
   // originó. No persiste: si el objeto se recicla mientras una solicitud
@@ -160,6 +169,7 @@ export class InstallationRelay extends DurableObject<Env> {
   // PlazoAgotadoTrasEntrega), aunque en ese caso ya no hay un llamador HTTP
   // a quien responder.
   private readonly solicitudesMcpPendientes = new Map<string, SolicitudMcpPendiente>();
+  private readonly capturasPendientes = new Map<string, CapturaPendiente>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -298,6 +308,9 @@ export class InstallationRelay extends DurableObject<Env> {
     }
     if (request.method === "DELETE" && url.pathname === "/internal/mcp") {
       return this.cerrarSesionMcpPorHeader(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/captures") {
+      return this.aceptarCaptura(request);
     }
     if (request.method === "POST" && url.pathname === "/internal/servicio") {
       return this.actualizarServicio(request);
@@ -928,6 +941,57 @@ export class InstallationRelay extends DurableObject<Env> {
     });
   }
 
+  // specs/capture-relay.allium — autentica una autoridad estrecha, rechaza
+  // cuando Vera no está conectada y transporta sin crear una bandeja remota.
+  private async aceptarCaptura(request: Request): Promise<Response> {
+    const bodyText = await request.text();
+    if (new TextEncoder().encode(bodyText).length > BYTES_MAXIMOS_POR_CAPTURA) {
+      return json(413, { codigo: "demasiado_grande" });
+    }
+    const instalacion = this.leerInstalacion();
+    if (!instalacion) return json(404, { codigo: "instalacion_desconocida" });
+
+    const auth = request.headers.get("Authorization");
+    const credencial = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+    const cliente = credencial ? await this.clientePorCredencialDeAcceso(credencial) : null;
+    if (!cliente) return json(401, { codigo: "no_autenticada" });
+    const alcances = this.leerConcesion(cliente.principal_id)?.alcances.split(",") ?? [];
+    if (!alcances.includes("capture")) return json(403, { codigo: "sin_alcance" });
+    if (instalacion.estado !== "conectada") return json(503, { codigo: "vera_offline" });
+
+    let cuerpo: { idempotencyKey?: unknown } | null = null;
+    try { cuerpo = JSON.parse(bodyText) as { idempotencyKey?: unknown }; } catch { /* rechazo abajo */ }
+    if (typeof cuerpo?.idempotencyKey !== "string" || cuerpo.idempotencyKey.length === 0) {
+      return json(400, { codigo: "captura_invalida" });
+    }
+
+    const ws = this.conexionDeEnlaceActiva();
+    const identificadorEfimero = this.identificadorDeConexionActiva();
+    if (!ws || !identificadorEfimero) return json(503, { codigo: "vera_offline" });
+    const requestId = randomToken(BITS_ENTROPIA_REQUEST_ID);
+
+    return new Promise<Response>((resolve) => {
+      const timer = setTimeout(() => this.resolverCaptura(requestId, 504, { codigo: "resultado_incierto" }), PLAZO_DE_CAPTURA_MS);
+      this.capturasPendientes.set(requestId, { resolve, timer, identificadorEfimero });
+      ws.send(JSON.stringify({
+        tipo: "captura",
+        request_id: requestId,
+        principal_id: cliente.principal_id,
+        identificador_de_idempotencia: cuerpo.idempotencyKey,
+        cuerpo: bodyText,
+      }));
+    });
+  }
+
+  private resolverCaptura(requestId: string, status: number, body: unknown, identificadorEfimero?: string): void {
+    const pendiente = this.capturasPendientes.get(requestId);
+    if (!pendiente) return;
+    if (identificadorEfimero && pendiente.identificadorEfimero !== identificadorEfimero) return;
+    clearTimeout(pendiente.timer);
+    this.capturasPendientes.delete(requestId);
+    pendiente.resolve(json(status, body));
+  }
+
   // rule EntregarSolicitud — asume instalación conectada, ya comprobado por
   // el llamador. Registra la solicitud, la entrega por el enlace activo y
   // deja pendiente su resolución hasta acuse, respuesta, plazo agotado,
@@ -1439,6 +1503,16 @@ export class InstallationRelay extends DurableObject<Env> {
     // rule ResponderSolicitud
     if (parsed.tipo === "sobre_respuesta") {
       this.resolverConRespuestaDeDesktop(parsed.request_id, parsed.payload ?? null, attachment.identificador_efimero);
+      return;
+    }
+
+    if (parsed.tipo === "captura_aceptada") {
+      this.resolverCaptura(parsed.request_id, 202, parsed.payload ?? { aceptada: true }, attachment.identificador_efimero);
+      return;
+    }
+
+    if (parsed.tipo === "captura_rechazada") {
+      this.resolverCaptura(parsed.request_id, 422, parsed.payload ?? { codigo: "contenido_invalido" }, attachment.identificador_efimero);
     }
   }
 
@@ -1469,6 +1543,9 @@ export class InstallationRelay extends DurableObject<Env> {
     if (resultado.rowsWritten > 0) {
       this.ctx.storage.sql.exec(`UPDATE instalacion SET estado = 'desconectada' WHERE estado = 'conectada'`);
       this.resolverSolicitudesPorVeraDesconectada();
+      for (const requestId of this.capturasPendientes.keys()) {
+        this.resolverCaptura(requestId, 503, { codigo: "resultado_incierto" });
+      }
     }
   }
 
