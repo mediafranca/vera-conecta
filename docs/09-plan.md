@@ -24,7 +24,9 @@ Salida: un eco autenticado extremo a extremo, no MCP productivo.
 - Streamable HTTP;
 - bearer piloto, scopes y revocación;
 - conector Desktop contra MCP local — primer recorrido real de catálogo y
-  `vera_buscar` probado localmente; falta integrarlo al ciclo de vida de la app;
+  `vera_buscar` probado localmente; supervisor de inicio, apagado y reconexión
+  probado como biblioteca; falta incorporarlo al ciclo de vida efectivo de la
+  app;
 - errores offline, timeout, límites y streaming;
 - MCP Inspector + Hermes.
 

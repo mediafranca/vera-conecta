@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { connectDesktop, forwardCaptureEnvelope, forwardRelayEnvelope, type RelayEnvelope } from "../src/desktop-connector";
+import {
+  connectDesktop,
+  forwardCaptureEnvelope,
+  forwardRelayEnvelope,
+  superviseDesktop,
+  type RelayEnvelope,
+} from "../src/desktop-connector";
 
 const envelope = (overrides: Partial<RelayEnvelope> = {}): RelayEnvelope => ({
   tipo: "sobre",
@@ -124,5 +130,84 @@ describe("conector Desktop", () => {
       headers: expect.objectContaining({ authorization: "Bearer capture-local" }),
     }));
     expect(sent).toContainEqual(expect.objectContaining({ tipo: "captura_aceptada", request_id: "capture-request" }));
+  });
+
+  it("acompaña el ciclo de vida de Desktop y reconecta una caída con espera", () => {
+    vi.useFakeTimers();
+    const sockets: Array<{
+      listeners: Map<string, (event: Event | MessageEvent) => void>;
+      close: ReturnType<typeof vi.fn>;
+    }> = [];
+    const states: string[] = [];
+    let sequence = 0;
+    const supervisor = superviseDesktop({
+      relayUrl: "https://conecta.example",
+      installationId: "installation-a",
+      linkSecret: "link-secret",
+      localMcpUrl: "http://127.0.0.1:4180/mcp",
+      credentialFor: async () => null,
+      connectionId: () => `connection-${++sequence}`,
+      reconnectBaseMs: 1_000,
+      random: () => 1,
+      onStatus: status => states.push(status),
+      webSocketFactory: () => {
+        const listeners = new Map<string, (event: Event | MessageEvent) => void>();
+        const socket = {
+          listeners,
+          addEventListener: (type: string, listener: (event: Event | MessageEvent) => void) => listeners.set(type, listener),
+          send: vi.fn(),
+          close: vi.fn(),
+        };
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    supervisor.start();
+    expect(sockets).toHaveLength(1);
+    sockets[0]?.listeners.get("open")?.(new Event("open"));
+    expect(supervisor.status()).toBe("conectada");
+    sockets[0]?.listeners.get("close")?.(new Event("close"));
+    expect(supervisor.status()).toBe("esperando");
+    vi.advanceTimersByTime(999);
+    expect(sockets).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(2);
+    expect(states).toEqual(["conectando", "conectada", "esperando", "conectando"]);
+
+    supervisor.stop();
+    expect(sockets[1]?.close).toHaveBeenCalledWith(1000, "desktop_stopped");
+    expect(supervisor.status()).toBe("detenida");
+    vi.useRealTimers();
+  });
+
+  it("no reconecta después de que Desktop se apaga", () => {
+    vi.useFakeTimers();
+    const listeners = new Map<string, (event: Event | MessageEvent) => void>();
+    const socket = {
+      addEventListener: (type: string, listener: (event: Event | MessageEvent) => void) => listeners.set(type, listener),
+      send: vi.fn(),
+      close: vi.fn(),
+    };
+    const factory = vi.fn(() => socket);
+    const supervisor = superviseDesktop({
+      relayUrl: "https://conecta.example",
+      installationId: "installation-a",
+      linkSecret: "link-secret",
+      localMcpUrl: "http://127.0.0.1:4180/mcp",
+      credentialFor: async () => null,
+      connectionId: () => "connection-a",
+      reconnectBaseMs: 1_000,
+      random: () => 1,
+      webSocketFactory: factory,
+    });
+
+    supervisor.start();
+    listeners.get("close")?.(new Event("close"));
+    supervisor.stop();
+    vi.runAllTimers();
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(supervisor.status()).toBe("detenida");
+    vi.useRealTimers();
   });
 });

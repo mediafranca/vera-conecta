@@ -67,8 +67,15 @@ credencial correspondiente a la identidad y alcances derivados por el relay.
 Una herramienta desconocida se clasifica como escritura y nunca amplía una
 concesión `read`.
 
-Todavía faltan integración con el ciclo de vida de Vera Desktop, streaming HTTP
-real y una prueba desde otro equipo contra staging. No se declara M2 completo.
+El conector ya cuenta además con un supervisor de ciclo de vida: abre un único
+enlace al iniciar, informa si está conectando, conectado o esperando, reconecta
+una caída con *backoff* exponencial y *jitter*, y cancela enlace y temporizadores
+al apagarse. Esta pieza está probada como biblioteca; todavía falta incorporarla
+al arranque y cierre efectivos de Vera Desktop.
+
+Todavía faltan la incorporación del supervisor al ciclo de vida efectivo de
+Vera Desktop, streaming HTTP real y una prueba desde otro equipo contra staging.
+No se declara M2 completo.
 
 No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
 la suite sobre `@cloudflare/vitest-pool-workers`.
