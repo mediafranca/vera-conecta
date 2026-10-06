@@ -7,6 +7,17 @@ aplicaciones estrechas como Vera Clip— lleguen a una instalación local de Ver
 mediante una conexión saliente que Vera mantiene hacia un relay administrado
 por MediaFranca.
 
+## Experiencia predeterminada
+
+`conecta.mediafranca.net` será un servicio compartido de la comunidad y la
+opción inicial de Vera Desktop. La persona activa Conecta desde Vera, autoriza
+una IA y recibe la información necesaria para ese cliente. No crea una cuenta
+Cloudflare, no administra DNS y no ejecuta instrucciones de terminal.
+
+El autoalojamiento sigue siendo una posibilidad soberana y documentada, no una
+precondición para usar el producto. Una instancia autoalojada conserva el mismo
+contrato de red, permisos y revocación que el servicio compartido.
+
 ## Problema
 
 ChatGPT, Claude y otros clientes ejecutados en la nube no pueden llamar al
@@ -51,6 +62,8 @@ Vera. Vera Conecta ofrece una puerta pública estable sin publicar toda Vera.
    copia servible del grafo.
 7. **El fallo es explícito.** Nunca se confirma una escritura cuyo resultado sea
    incierto.
+8. **El camino simple es el comunitario.** La infraestructura compartida no
+   convierte a MediaFranca en custodio del grafo ni de las claves del proveedor.
 
 ## Éxito del piloto
 

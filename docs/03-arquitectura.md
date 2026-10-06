@@ -1,5 +1,35 @@
 # Arquitectura
 
+## Vista general
+
+```mermaid
+flowchart LR
+    subgraph Nube[Internet]
+      IA[Cliente de IA<br/>ChatGPT, Claude, otro MCP]
+      Relay[Vera Conecta<br/>Worker + Durable Object]
+    end
+    subgraph Equipo[Computador de la persona]
+      Desktop[Vera Desktop]
+      Puerta[Puerta MCP local]
+      Vera[(Biblioteca Vera)]
+    end
+
+    IA -->|HTTPS + OAuth o bearer| Relay
+    Desktop -->|WebSocket saliente persistente| Relay
+    Desktop -->|loopback + credencial local| Puerta
+    Puerta -->|operaciones atribuidas| Vera
+
+    classDef soberano fill:#eaf4e8,stroke:#477a44,color:#183d17
+    classDef transito fill:#fff2df,stroke:#a66b18,color:#4f330d
+    class Desktop,Puerta,Vera soberano
+    class Relay transito
+```
+
+El diagrama muestra la asimetría deliberada: el relay es alcanzable desde
+Internet, pero la biblioteca no. Desktop mantiene el único enlace hacia afuera
+y convierte cada identidad remota en una credencial local de alcance igual o
+menor.
+
 ## Componentes
 
 ### Worker de borde

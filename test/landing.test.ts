@@ -8,7 +8,7 @@ describe("página pública en la raíz", () => {
     expect(response.headers.get("content-type")).toContain("text/html");
     const body = await response.text();
     expect(body).toContain("Vera Conecta");
-    expect(body).toContain("todavía no operativo");
+    expect(body).toContain("piloto verificado localmente; despliegue público pendiente");
   });
 
   it("no interfiere con las rutas del relay", async () => {

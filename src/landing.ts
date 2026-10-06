@@ -74,18 +74,18 @@ const PAGINA = `<!doctype html>
   </p>
 
   <div class="estado">
-    <strong>Estado: en construcción, todavía no operativo.</strong>
+    <strong>Estado: piloto verificado localmente; despliegue público pendiente.</strong>
     <p style="margin: 0.6rem 0 0">
-      El enlace de instalación entre Vera Desktop y este relay ya está
-      probado de punta a punta. El endpoint MCP remoto que un cliente en la
-      nube alcanzaría, y las credenciales por cliente, están especificados
-      pero sin implementar: esas rutas responden <code>501</code> a
-      propósito, en vez de simular algo que no existe.
+      El enlace de instalación, el endpoint MCP, las credenciales separadas
+      por cliente y su revocación están probados de punta a punta en local.
+      Este origen todavía no debe considerarse disponible para bibliotecas
+      reales hasta completar el despliegue y las pruebas externas.
     </p>
   </div>
 
   <p>Mientras tanto:</p>
   <ul>
+    <li><a href="https://vera.mediafranca.net/vera-conecta/">Qué es Vera Conecta y cómo se usará</a></li>
     <li><a href="https://github.com/mediafranca/vera-conecta">Código y especificaciones de Vera Conecta</a></li>
     <li><a href="https://github.com/mediafranca/vera">Vera</a>, la memoria personal que este relay conecta</li>
   </ul>

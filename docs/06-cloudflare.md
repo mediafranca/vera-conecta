@@ -38,6 +38,10 @@ npm run check
 `whoami` debe mostrar la cuenta que contiene la zona `mediafranca.net`. No se
 guardan API tokens en `.env` ni en el repositorio.
 
+La autenticación de Wrangler y la creación de infraestructura corresponden al
+operador del servicio, no a las personas que instalan Vera. Una Vera cliente
+sólo conoce el origen público del relay y abre hacia él una conexión saliente.
+
 ## Staging
 
 ```sh
@@ -52,12 +56,16 @@ producción. No recibe datos personales reales.
 
 1. Revisar `wrangler.jsonc` y el diff del despliegue.
 2. Activar Workers Paid.
-3. Cargar secretos individualmente:
+3. Generar y cargar el único secreto operacional actual:
 
    ```sh
-   npx wrangler secret put VERA_CONECTA_ADMIN_SECRET
    npx wrangler secret put VERA_CONECTA_TOKEN_PEPPER
    ```
+
+   `VERA_CONECTA_TOKEN_PEPPER` debe ser aleatorio, distinto entre ambientes y
+   permanecer fuera del historial del shell y de Git. No existe actualmente un
+   `VERA_CONECTA_ADMIN_SECRET`: la autoridad administrativa de una instalación
+   es su secreto de enlace custodiado por Vera Desktop.
 
 4. Ejecutar suite, prueba de aislamiento y prueba de revocación.
 5. `npm run deploy:production`.
@@ -65,6 +73,11 @@ producción. No recibe datos personales reales.
    `custom_domain: true` para `conecta.mediafranca.net`.
 7. Verificar TLS, `/health`, que rutas no implementadas estén cerradas y que no
    exista un CNAME manual conflictivo.
+
+La asociación `custom_domain: true` crea la ruta, el registro DNS y el
+certificado en la zona existente. No crear además un A o CNAME manual para el
+mismo nombre. Antes del despliegue definitivo se debe cambiar la producción a
+`workers_dev: false`; staging conserva su subdominio `workers.dev`.
 
 No desplegar desde una estación sucia ni desde `main` sin commit. El primer
 despliegue productivo requiere confirmación explícita de Herbert.
