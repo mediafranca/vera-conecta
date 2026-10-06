@@ -31,6 +31,7 @@
     "staging": {
       "name": "vera-conecta-staging",
       "workers_dev": true,
+      "routes": [],
       "durable_objects": {
         "bindings": [
           {
