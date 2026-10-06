@@ -26,6 +26,18 @@ backoff, almacena secretos en Keychain/Credential Manager/libsecret, convierte
 sobres del relay en llamadas MCP a `127.0.0.1` y aplica la identidad Vera local.
 Nunca escucha una interfaz pública.
 
+### Autorización sin identidad central
+
+Conecta no recibe la cuenta ni las claves del proveedor de IA. ChatGPT, Claude
+u otro cliente se autentican frente al endpoint MCP de una instalación. En el
+piloto Desktop emite un bearer revocable; en beta el Worker usa OAuth 2.1 y
+Desktop resuelve el consentimiento. La concesión —cliente, instalación y
+alcances— es la misma en ambos casos.
+
+La URL pública es un localizador opaco. Listar clientes, emitir invitaciones o
+revocarlas exige el secreto de enlace que sólo Desktop puede abrir desde el
+almacén seguro del sistema operativo.
+
 El límite entre ambos repositorios queda fijado por este recorrido:
 
 ```mermaid

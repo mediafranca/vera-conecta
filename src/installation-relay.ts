@@ -19,6 +19,7 @@ const ALARM_TICK_MS = 15_000;
 // specs/client-grants.allium § config
 const VIGENCIA_DE_AUTORIZACION_PENDIENTE_MS = 10 * 60_000;
 const VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS = 60 * 60_000;
+const VIGENCIA_DE_BEARER_MANUAL_MS = 90 * 24 * 60 * 60_000;
 const VENTANA_DE_REFRESCO_MS = 90 * 24 * 60 * 60_000;
 const BITS_ENTROPIA_CREDENCIAL = 256;
 const ALCANCES_VALIDOS = ["read", "write", "delete", "capture"] as const;
@@ -289,7 +290,7 @@ export class InstallationRelay extends DurableObject<Env> {
       return this.autorizarCliente(request);
     }
     if (request.method === "GET" && url.pathname === "/internal/clients") {
-      return this.listarClientes();
+      return this.listarClientes(request);
     }
     const claimClienteMatch = url.pathname.match(/^\/internal\/clients\/([^/]+)\/claim$/);
     if (request.method === "POST" && claimClienteMatch) {
@@ -721,13 +722,18 @@ export class InstallationRelay extends DurableObject<Env> {
       return json(410, { error: "autorizacion_caducada" });
     }
 
+    const concesion = this.leerConcesion(principalId);
+    if (!concesion) return json(409, { error: "concesion_no_disponible" });
+    const manual = concesion.evidencia === "bearer_del_piloto";
     const now = Date.now();
-    const expiraEn = now + VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS;
+    const expiraEn = now + (manual ? VIGENCIA_DE_BEARER_MANUAL_MS : VIGENCIA_DE_CREDENCIAL_DE_ACCESO_MS);
     const refrescoExpiraEn = now + VENTANA_DE_REFRESCO_MS;
     const secretoDeAcceso = randomToken(BITS_ENTROPIA_CREDENCIAL);
-    const secretoDeRefresco = randomToken(BITS_ENTROPIA_CREDENCIAL);
+    const secretoDeRefresco = manual ? null : randomToken(BITS_ENTROPIA_CREDENCIAL);
     const hashDeAcceso = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secretoDeAcceso);
-    const hashDeRefresco = await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secretoDeRefresco);
+    const hashDeRefresco = secretoDeRefresco === null
+      ? null
+      : await hashWithPepper(this.env.VERA_CONECTA_TOKEN_PEPPER, secretoDeRefresco);
 
     this.ctx.storage.sql.exec(
       `UPDATE clientes
@@ -742,10 +748,9 @@ export class InstallationRelay extends DurableObject<Env> {
     );
     await this.scheduleNextAlarm();
 
-    const concesion = this.leerConcesion(principalId);
     return json(201, {
       secreto_de_cliente: secretoDeAcceso,
-      secreto_de_refresco: secretoDeRefresco,
+      ...(secretoDeRefresco === null ? {} : { secreto_de_refresco: secretoDeRefresco }),
       alcances: concesion?.alcances.split(",") ?? [],
       expira_en: new Date(expiraEn).toISOString(),
       refresco_expira_en: new Date(refrescoExpiraEn).toISOString(),
@@ -826,7 +831,12 @@ export class InstallationRelay extends DurableObject<Env> {
     return json(200, { ok: true });
   }
 
-  private async listarClientes(): Promise<Response> {
+  private async listarClientes(request: Request): Promise<Response> {
+    const authorization = request.headers.get("authorization");
+    const secreto = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
+    if (!secreto || !(await this.verificarSecretoDeEnlace(secreto))) {
+      return json(401, { error: "credencial_de_enlace_invalida" });
+    }
     const clientes = this.ctx.storage.sql
       .exec<ClienteRow>(
         `SELECT principal_id, etiqueta_de_aplicacion, estado, creado_en, expira_en, refresco_expira_en FROM clientes`,
@@ -1415,11 +1425,11 @@ export class InstallationRelay extends DurableObject<Env> {
     );
   }
 
-  private leerConcesion(principalId: string): { alcances: string } | null {
+  private leerConcesion(principalId: string): { alcances: string; evidencia: Evidencia } | null {
     return (
       this.ctx.storage.sql
-        .exec<{ alcances: string } & Record<string, SqlStorageValue>>(
-          `SELECT alcances FROM concesiones WHERE cliente_principal_id = ?`,
+        .exec<{ alcances: string; evidencia: Evidencia } & Record<string, SqlStorageValue>>(
+          `SELECT alcances, evidencia FROM concesiones WHERE cliente_principal_id = ?`,
           principalId,
         )
         .toArray()[0] ?? null

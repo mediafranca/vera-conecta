@@ -78,7 +78,9 @@ export default {
       const idPublico = decodeURIComponent(clientsMatch[1]);
       const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
       if (request.method === "GET") {
-        return installation.fetch(new Request("http://do/internal/clients"));
+        return installation.fetch(new Request("http://do/internal/clients", {
+          headers: { authorization: request.headers.get("authorization") ?? "" },
+        }));
       }
       const bodyText = await request.text();
       return installation.fetch(

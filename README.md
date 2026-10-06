@@ -22,7 +22,7 @@ https://conecta.mediafranca.net/v/<id-publico>/mcp
 
 ## Estado
 
-**M0 completo, M1 casi completo y primer corte de M2 probado localmente.** Las cinco specs Allium (`specs/*.allium`) fijan
+**M0 completo, M1 casi completo y primer corte de M2 probado localmente.** Las specs Allium (`specs/*.allium`) fijan
 el contrato; cada una deja preguntas abiertas explícitas todavía sin decidir.
 
 Probado extremo a extremo, sin memoria real:
@@ -34,8 +34,10 @@ Probado extremo a extremo, sin memoria real:
   Durable Objects y la propia spec no resuelve si conserva las autorizaciones de
   cliente.
 - `client-grants.allium`: autorizar un cliente MCP por instalación, que reclame
-  su credencial propia, y revocarlo — individualmente o en cascada al revocar la
-  instalación completa.
+  su credencial propia, listarlo sólo desde Desktop y revocarlo —individualmente
+  o en cascada al revocar la instalación completa—. El piloto entrega una vez
+  un bearer manual de 90 días para clientes con cabecera fija; no expone el
+  secreto de enlace ni ofrece un refresco que esos clientes no podrían usar.
 - `mcp-relay.allium`: `POST /v/:id/mcp` acepta, clasifica, entrega por el enlace
   activo y resuelve una solicitud MCP (respuesta, plazo agotado, Vera
   desconectada, reintento de lectura no acusada o conflicto de enlace tras un
@@ -57,7 +59,7 @@ Probado extremo a extremo, sin memoria real:
 implementar, salvo el interruptor manual `escrituras_admitidas`
 (`POST /v/:id/servicio`) que `mcp-relay` necesita — la degradación automática
 por umbral sigue siendo la pregunta abierta de esa spec. `/health` responde;
-OAuth (`client-grants` usa bearer del piloto) sigue fuera de alcance hasta M4.
+OAuth sigue fuera de alcance hasta M4.
 
 El primer corte M2 conecta el relay local con la puerta MCP real de Vera: el
 catálogo y una llamada de lectura (`vera_buscar`) recorren cliente → relay →
@@ -70,8 +72,10 @@ concesión `read`.
 El conector ya cuenta además con un supervisor de ciclo de vida: abre un único
 enlace al iniciar, informa si está conectando, conectado o esperando, reconecta
 una caída con *backoff* exponencial y *jitter*, y cancela enlace y temporizadores
-al apagarse. Esta pieza está probada como biblioteca; todavía falta incorporarla
-al arranque y cierre efectivos de Vera Desktop.
+al apagarse. Vera Desktop también puede crear, mostrar una sola vez, listar y
+revocar accesos para clientes remotos sin entregar al renderer su secreto de
+enlace. Ambas piezas están probadas localmente; todavía falta una prueba contra
+un relay desplegado.
 
 La frontera y el recorrido completo se mantienen en el diagrama Mermaid de
 [`docs/03-arquitectura.md`](docs/03-arquitectura.md#conector-de-vera-desktop).
@@ -80,9 +84,8 @@ contrato del relay y sus simuladores. Ningún lado puede declararse compatible
 por separado: una versión de protocolo sólo se publica después de probar el
 recorrido Desktop → relay → puerta local → Desktop.
 
-Todavía faltan la incorporación del supervisor al ciclo de vida efectivo de
-Vera Desktop, streaming HTTP real y una prueba desde otro equipo contra staging.
-No se declara M2 completo.
+Todavía faltan OAuth 2.1, streaming HTTP real y una prueba desde otro equipo
+contra staging. No se declara M2 completo.
 
 No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
 la suite sobre `@cloudflare/vitest-pool-workers`.
@@ -111,6 +114,7 @@ la suite sobre `@cloudflare/vitest-pool-workers`.
 8. [Brief para Allium](docs/08-allium-brief.md)
 9. [Plan de implementación](docs/09-plan.md)
 10. [Fuentes técnicas](docs/10-fuentes.md)
+11. [ADR 0003 — OAuth sin cuenta MediaFranca](docs/decisions/0003-autorizacion-sin-cuenta-mediafranca.md)
 
 ## Desarrollo
 
