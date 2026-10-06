@@ -1,0 +1,136 @@
+-- allium: 3
+-- Vera Conecta — transporte estrecho de capturas de Vera Clip
+-- El relay autentica y transporta; Vera valida y escribe. El contenido existe
+-- en Vera Conecta sólo mientras está en tránsito y nunca forma una bandeja.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity InstalacionVera {
+    identificador_publico: String
+    conectada: Boolean
+}
+
+external entity CredencialDeCaptura {
+    identificador: String
+    instalacion: InstalacionVera
+    vigente: Boolean
+    permite_capturar: Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum EstadoDeCapturaEnTransito { recibida | entregada | aceptada | incierta | rechazada }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity CapturaEnTransito {
+    identificador_de_idempotencia: String
+    instalacion: InstalacionVera
+    credencial: CredencialDeCaptura
+    estado: EstadoDeCapturaEnTransito
+
+    transitions estado {
+        recibida -> entregada
+        entregada -> aceptada
+        entregada -> incierta
+        terminal: aceptada, incierta
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RecibirCapturaAutorizada {
+    when: VeraClipEnviaCaptura(instalacion, credencial, identificador_de_idempotencia)
+    requires: credencial.instalacion = instalacion
+    requires: credencial.vigente
+    requires: credencial.permite_capturar
+    requires: instalacion.conectada
+    ensures: CapturaEnTransito.created(
+        identificador_de_idempotencia: identificador_de_idempotencia,
+        instalacion: instalacion,
+        credencial: credencial,
+        estado: recibida
+    )
+}
+
+rule EntregarCapturaAVera {
+    when: captura: CapturaEnTransito.created
+    requires: captura.estado = recibida
+    ensures: captura.estado = entregada
+}
+
+rule ConfirmarCapturaAceptada {
+    when: VeraAcusaCaptura(captura)
+    requires: captura.estado = entregada
+    ensures: captura.estado = aceptada
+}
+
+rule MarcarResultadoIncierto {
+    when: EnlaceCaeAntesDelAcuse(captura)
+    requires: captura.estado = entregada
+    ensures: captura.estado = incierta
+
+    @guidance
+        -- Vera Clip puede reintentar con el mismo identificador de
+        -- idempotencia. El relay nunca inventa otro ni confirma éxito.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ClienteVeraClip {
+    identified_by: CredencialDeCaptura
+}
+
+actor VeraLocal {
+    identified_by: InstalacionVera
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EntradaDeCapturas {
+    facing cliente: ClienteVeraClip
+
+    provides:
+        VeraClipEnviaCaptura(instalacion, credencial, identificador_de_idempotencia)
+
+    exposes:
+        CapturasEnTransito
+
+    @guarantee AutoridadEstrecha
+        -- La credencial permite capturar, pero no leer el grafo ni ejecutar
+        -- operaciones arbitrarias.
+
+    @guarantee SinBandejaRemota
+        -- Si Vera no está conectada, el relay rechaza de forma explícita y no
+        -- conserva una copia para entregarla después.
+}
+
+surface EnlaceDeCapturasConVera {
+    facing vera: VeraLocal
+
+    provides:
+        VeraAcusaCaptura(captura)
+        EnlaceCaeAntesDelAcuse(captura)
+
+    @guarantee VeraDecideLaEscritura
+        -- Sólo Vera valida y aplica el depósito mediante sus operaciones
+        -- canónicas; el relay no crea bloques ni decide su destino.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "¿La ceremonia de emparejamiento de Vera Clip reutiliza concesiones de clientes o tiene una superficie propia orientada a personas?"

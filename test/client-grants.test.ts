@@ -70,6 +70,12 @@ async function revocarCliente(idPublico: string, principalId: string, secretoDeE
   });
 }
 
+async function listarClientes(idPublico: string, secretoDeEnlace?: string): Promise<Response> {
+  return SELF.fetch(`https://vera-conecta.test/v/${idPublico}/clients`, {
+    headers: secretoDeEnlace === undefined ? {} : { authorization: `Bearer ${secretoDeEnlace}` },
+  });
+}
+
 async function refrescarCredencial(idPublico: string, principalId: string, pruebaDeRefresco: string): Promise<Response> {
   return SELF.fetch(`https://vera-conecta.test/v/${idPublico}/clients/${principalId}/refresh`, {
     method: "POST",
@@ -135,16 +141,16 @@ describe("reclamo de credencial", () => {
     expect(reclamo.status).toBe(201);
     const cuerpo = (await reclamo.json()) as {
       secreto_de_cliente: string;
-      secreto_de_refresco: string;
+      secreto_de_refresco?: string;
       alcances: string[];
       expira_en: string;
       refresco_expira_en: string;
     };
     expect(cuerpo.secreto_de_cliente).toBeTruthy();
-    expect(cuerpo.secreto_de_refresco).toBeTruthy();
-    expect(cuerpo.secreto_de_cliente).not.toBe(cuerpo.secreto_de_refresco);
+    expect(cuerpo.secreto_de_refresco).toBeUndefined();
     expect(cuerpo.alcances).toEqual(["read"]);
-    expect(new Date(cuerpo.refresco_expira_en).getTime()).toBeGreaterThan(new Date(cuerpo.expira_en).getTime());
+    expect(new Date(cuerpo.expira_en).getTime() - Date.now()).toBeGreaterThan(89 * 24 * 60 * 60_000);
+    expect(cuerpo.refresco_expira_en).toBe(cuerpo.expira_en);
   });
 
   it("un segundo reclamo del mismo cliente falla: ya no está pendiente", async () => {
@@ -176,11 +182,11 @@ describe("refresco de credencial", () => {
     const autorizacion = await autorizarCliente(id_publico, secreto_de_enlace);
     const { principal_id } = (await autorizacion.json()) as AutorizacionPendiente;
     const reclamo = await reclamarCredencial(id_publico, principal_id);
-    const { secreto_de_refresco } = (await reclamo.json()) as { secreto_de_refresco: string };
+    const { secreto_de_refresco } = (await reclamo.json()) as { secreto_de_refresco?: string };
 
     // RefrescarCredencialDeCliente exige estado credencial_vencida:
     // "autorizado" (recién reclamado, sin haber vencido) no basta.
-    const respuesta = await refrescarCredencial(id_publico, principal_id, secreto_de_refresco);
+    const respuesta = await refrescarCredencial(id_publico, principal_id, secreto_de_refresco ?? "sin-refresco");
     expect(respuesta.status).toBe(409);
   });
 
@@ -220,7 +226,7 @@ describe("revocación de clientes", () => {
     // Revocar A no interrumpe a B: B sigue pudiendo reclamar... salvo que ya
     // reclamó, así que verificamos que su estado siga siendo 'autorizado'
     // consultando el listado de clientes.
-    const listado = await SELF.fetch(`https://vera-conecta.test/v/${id_publico}/clients`);
+    const listado = await listarClientes(id_publico, secreto_de_enlace);
     const { clientes } = (await listado.json()) as { clientes: { principal_id: string; estado: string }[] };
     const estadoA = clientes.find((c) => c.principal_id === principalA)?.estado;
     const estadoB = clientes.find((c) => c.principal_id === principalB)?.estado;
@@ -234,7 +240,8 @@ describe("revocación de clientes", () => {
 
     const autorizacion = await autorizarCliente(id_publico, secreto_de_enlace);
     const { principal_id } = (await autorizacion.json()) as AutorizacionPendiente;
-    await reclamarCredencial(id_publico, principal_id);
+    const reclamo = await reclamarCredencial(id_publico, principal_id);
+    const { secreto_de_cliente } = (await reclamo.json()) as { secreto_de_cliente: string };
 
     const revocacionInstalacion = await SELF.fetch(`https://vera-conecta.test/v/${id_publico}/revoke`, {
       method: "POST",
@@ -243,8 +250,31 @@ describe("revocación de clientes", () => {
     });
     expect(revocacionInstalacion.status).toBe(200);
 
-    const listado = await SELF.fetch(`https://vera-conecta.test/v/${id_publico}/clients`);
-    const { clientes } = (await listado.json()) as { clientes: { principal_id: string; estado: string }[] };
-    expect(clientes.find((c) => c.principal_id === principal_id)?.estado).toBe("revocado");
+    const listado = await listarClientes(id_publico, secreto_de_enlace);
+    expect(listado.status).toBe(401);
+
+    const acceso = await SELF.fetch(`https://vera-conecta.test/v/${id_publico}/mcp`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${secreto_de_cliente}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(acceso.status).toBe(404);
+  });
+});
+
+describe("listado de clientes", () => {
+  it("no revela clientes a quien sólo conoce el identificador público", async () => {
+    const { id_publico, secreto_de_enlace } = await emparejarInstalacion();
+    await abrirEnlaceParaConectar(id_publico, secreto_de_enlace);
+    await autorizarCliente(id_publico, secreto_de_enlace, "Claude privado");
+
+    const sinPrueba = await listarClientes(id_publico);
+    expect(sinPrueba.status).toBe(401);
+    expect(await sinPrueba.json()).toEqual({ error: "credencial_de_enlace_invalida" });
+
+    const conPrueba = await listarClientes(id_publico, secreto_de_enlace);
+    expect(conPrueba.status).toBe(200);
+    const cuerpo = (await conPrueba.json()) as { clientes: { etiqueta_de_aplicacion: string }[] };
+    expect(cuerpo.clientes.map((cliente) => cliente.etiqueta_de_aplicacion)).toContain("Claude privado");
   });
 });

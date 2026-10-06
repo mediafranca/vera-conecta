@@ -1,63 +1,101 @@
 # Vera Conecta
 
-Vera Conecta será el puente opcional entre una instalación local de
-[Vera](https://github.com/mediafranca/vera) y los clientes MCP que viven en
-Internet. La instalación inicia una conexión saliente; la persona no abre
-puertos, no administra una IP pública y no instala Tailscale.
+Vera Conecta es el puente comunitario entre una instalación local de
+[Vera](https://github.com/mediafranca/vera) y una inteligencia artificial que
+vive en Internet. Vera Desktop abre una conexión saliente hacia un relay
+compartido de MediaFranca; la persona no instala Cloudflare, no compra un
+dominio, no abre puertos y no publica su biblioteca.
 
-```text
-ChatGPT / Claude / otro cliente MCP
-              |
-              | HTTPS + OAuth o bearer revocable
-              v
-https://conecta.mediafranca.net/v/<id-publico>/mcp
-              |
-              | Cloudflare Worker + Durable Object
-              v
-      WebSocket saliente persistente
-              |
-              v
-       Vera Desktop -> MCP local
+> La documentación canónica para personas estará en
+> [VERA Conecta](https://vera.mediafranca.net/vera-conecta/). Mientras esa página
+> termina de publicarse, este repositorio conserva el contrato técnico y el
+> estado comprobable de la implementación.
+
+```mermaid
+flowchart LR
+    IA[ChatGPT, Claude u otro cliente MCP]
+    Relay[conecta.mediafranca.net<br/>relay compartido]
+    Desktop[Vera Desktop<br/>conector local]
+    Grafo[(Vera local<br/>grafo soberano)]
+
+    IA -->|HTTPS + credencial revocable| Relay
+    Desktop -->|WebSocket saliente| Relay
+    Desktop -->|MCP en loopback| Grafo
 ```
 
-## Estado
+El relay transporta solicitudes mientras Vera está conectada. No aloja una
+copia del grafo, no recibe las claves de OpenAI o Anthropic y no compra
+inferencia. La suscripción y la conversación siguen perteneciendo al cliente de
+IA; la memoria, la autoridad y la procedencia permanecen en Vera.
 
-**M0 completo, M1 casi completo.** Las cinco specs Allium (`specs/*.allium`) fijan
-el contrato; cada una deja preguntas abiertas explícitas todavía sin decidir.
+## Para quién es cada documento
 
-Probado extremo a extremo, sin memoria real:
+- **Personas usuarias:** [guía de uso y conexión de una IA](docs/11-guia-de-uso.md).
+- **Operadores de MediaFranca o de una instancia propia:**
+  [despliegue del servicio](docs/12-despliegue-del-servicio.md).
+- **Desarrollo y revisión de seguridad:** [índice técnico](#documentación-técnica),
+  specs Allium y ADR.
+- **Explicación pública y filosofía:**
+  [página canónica en Vera](https://vera.mediafranca.net/vera-conecta/).
 
-- `installation-link.allium`: emparejamiento de un solo uso, apertura del canal
-  WebSocket hibernable, latido, desplazamiento de conexión, revocación por
-  silencio o abandono, rotación de secreto y revocación de la instalación. Falta
-  sólo `DesktopRegeneraIdPublico`, aplazada porque exige migrar estado entre
-  Durable Objects y la propia spec no resuelve si conserva las autorizaciones de
-  cliente.
-- `client-grants.allium`: autorizar un cliente MCP por instalación, que reclame
-  su credencial propia, y revocarlo — individualmente o en cascada al revocar la
-  instalación completa.
+## Decisión de producto
 
-Nada de esto todavía toca MCP en sí ni el grafo de Vera: sigue faltando
-`mcp-relay.allium`, el endpoint `/v/:id/mcp` que un cliente MCP remoto (Claude,
-Codex, etc.) usaría de verdad con la credencial que emite client-grants. `/health`
-responde; las rutas que aún no tienen contrato probado (MCP, OAuth) contestan
-`501` deliberadamente.
+El camino predeterminado será el relay compartido de la comunidad en
+`conecta.mediafranca.net`. Cada Vera Desktop se enlaza con él por una conexión
+saliente. El autoalojamiento seguirá siendo posible para quien lo necesite, pero
+no será un requisito ni la experiencia inicial.
 
-No hay ningún ambiente desplegado: sólo se ha probado con `wrangler dev` y con
-la suite sobre `@cloudflare/vitest-pool-workers`.
+La URL ubica una instalación; nunca autoriza por sí sola. Cada IA recibe su
+propia identidad, alcances y credencial. La persona puede revocar un cliente sin
+desconectar los demás.
 
-## Dirección acordada
+## Estado comprobado
 
-- Producto: **Vera Conecta**.
-- Repositorio: `vera-conecta`.
-- Producción: `https://conecta.mediafranca.net`.
-- MCP por instalación: `https://conecta.mediafranca.net/v/<id-publico>/mcp`.
-- Hospedaje: Cloudflare Workers + Durable Objects con WebSockets hibernables.
-- Zona DNS: la cuenta y zona existentes de `mediafranca.net` en Cloudflare.
-- Plan: Free durante desarrollo; Workers Paid antes de una prueba externa.
-- Memoria: el relay nunca conserva páginas, bloques, adjuntos ni respuestas MCP.
+El relay tiene un **staging público operativo** en
+`https://vera-conecta-staging.mediafranca.workers.dev`. Producción todavía no
+está desplegada y `conecta.mediafranca.net` no debe anunciarse como disponible.
 
-## Lectura recomendada
+- emparejamiento de una instalación y WebSocket saliente hibernable;
+- endpoint MCP remoto por instalación;
+- concesiones separadas por cliente, con lectura, escritura y borrado;
+- bearer manual de 90 días, mostrado una sola vez y revocable;
+- interfaz Desktop para activar Conecta, autorizar, listar y revocar clientes;
+- paso extremo a extremo cliente → relay → Desktop → MCP local → Vera;
+- canal estrecho para Vera Clip, separado del acceso MCP general;
+- 57 pruebas del relay y el empaquetado completo de Vera Desktop verificados.
+
+El 6 de octubre de 2026 se probó staging con dos instalaciones Vera efímeras:
+emparejamiento, WebSocket saliente, lectura MCP real, aislamiento, revocación,
+desconexión y reconexión. La prueba descubrió y corrigió en Vera la integración
+de la puerta MCP local; esa corrección debe publicarse junto con una versión de
+Desktop antes del piloto.
+
+Todavía faltan la integración protegida de ambos repositorios, el despliegue y
+la prueba externa contra `conecta.mediafranca.net`, OAuth 2.1, streaming HTTP
+completo y las puertas de seguridad de la beta.
+
+### Compatibilidad prevista
+
+- **Claude con cabecera fija:** el piloto bearer ya está implementado; será
+  utilizable cuando el relay y una versión de Vera que incluya el conector estén
+  publicados.
+- **ChatGPT:** requiere el flujo OAuth 2.1 del hito M4; todavía no se ofrece como
+  conexión de usuario final.
+- **Otros clientes MCP:** dependerá de que admitan MCP remoto con bearer fijo o
+  el OAuth que publicará Conecta. Cada cliente debe verificarse expresamente.
+
+## Principios
+
+1. La biblioteca permanece local y bajo autoridad de Vera.
+2. Vera inicia la conexión; nunca se abre un puerto doméstico.
+3. El relay minimiza metadatos y no persiste páginas, bloques, prompts ni
+   respuestas MCP.
+4. Cloudflare sí forma parte del trayecto y termina TLS: la promesa es
+   minimización y no persistencia, no invisibilidad criptográfica del relay.
+5. Una credencial por cliente permite atribuir y revocar sin compartir secretos.
+6. Una operación incierta nunca se confirma como si hubiera terminado bien.
+
+## Documentación técnica
 
 1. [Alcance y producto](docs/01-producto.md)
 2. [Modelo de dominio y recorridos](docs/02-dominio-y-recorridos.md)
@@ -69,16 +107,18 @@ la suite sobre `@cloudflare/vitest-pool-workers`.
 8. [Brief para Allium](docs/08-allium-brief.md)
 9. [Plan de implementación](docs/09-plan.md)
 10. [Fuentes técnicas](docs/10-fuentes.md)
+11. [Guía de uso](docs/11-guia-de-uso.md)
+12. [Despliegue del servicio](docs/12-despliegue-del-servicio.md)
+13. [ADR 0003 — autorización sin cuenta MediaFranca](docs/decisions/0003-autorizacion-sin-cuenta-mediafranca.md)
 
 ## Desarrollo
 
 ```sh
 npm install
-npm run typecheck
-npm test
+npm run check
 npm run dev
 ```
 
 No ejecutar `npm run deploy:production` ni asociar el dominio sin revisión de
-seguridad y autorización explícita. Los secretos se cargan con `wrangler secret
-put`; jamás se escriben en Git, ejemplos, issues o logs.
+seguridad y autorización explícita. Los secretos se cargan mediante Wrangler;
+nunca se escriben en Git, ejemplos, issues o logs.

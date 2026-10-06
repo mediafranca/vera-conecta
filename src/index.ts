@@ -15,11 +15,11 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(200, { service: "vera-conecta", status: "design-skeleton" });
+      return json(200, { service: "vera-conecta", status: "ok", protocol: 1 });
     }
 
     if (request.method === "GET" && url.pathname === "/") {
-      return landingResponse();
+      return landingResponse(url.hostname);
     }
 
     if (request.method === "POST" && url.pathname === "/pairings") {
@@ -78,7 +78,9 @@ export default {
       const idPublico = decodeURIComponent(clientsMatch[1]);
       const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
       if (request.method === "GET") {
-        return installation.fetch(new Request("http://do/internal/clients"));
+        return installation.fetch(new Request("http://do/internal/clients", {
+          headers: { authorization: request.headers.get("authorization") ?? "" },
+        }));
       }
       const bodyText = await request.text();
       return installation.fetch(
@@ -98,6 +100,35 @@ export default {
       const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
       return installation.fetch(
         new Request(`http://do/internal/clients/${encodeURIComponent(principalId)}/${clientActionMatch[3]}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText,
+        }),
+      );
+    }
+
+    const mcpMatch = url.pathname.match(/^\/v\/([^/]+)\/mcp$/);
+    if (mcpMatch && (request.method === "POST" || request.method === "DELETE")) {
+      const idPublico = decodeURIComponent(mcpMatch[1]);
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      const target = new URL("http://do/internal/mcp");
+      return installation.fetch(new Request(target, request));
+    }
+
+    const capturesMatch = url.pathname.match(/^\/v\/([^/]+)\/captures$/);
+    if (request.method === "POST" && capturesMatch) {
+      const idPublico = decodeURIComponent(capturesMatch[1]);
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      return installation.fetch(new Request("http://do/internal/captures", request));
+    }
+
+    const servicioMatch = url.pathname.match(/^\/v\/([^/]+)\/servicio$/);
+    if (request.method === "POST" && servicioMatch) {
+      const idPublico = decodeURIComponent(servicioMatch[1]);
+      const bodyText = await request.text();
+      const installation = env.INSTALLATIONS.get(env.INSTALLATIONS.idFromName(idPublico));
+      return installation.fetch(
+        new Request("http://do/internal/servicio", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: bodyText,

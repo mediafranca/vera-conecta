@@ -3,7 +3,8 @@
   "name": "vera-conecta",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
-  "workers_dev": true,
+  "workers_dev": false,
+  "preview_urls": false,
   "routes": [
     {
       "pattern": "conecta.mediafranca.net",
@@ -31,6 +32,8 @@
     "staging": {
       "name": "vera-conecta-staging",
       "workers_dev": true,
+      "preview_urls": false,
+      "routes": [],
       "durable_objects": {
         "bindings": [
           {

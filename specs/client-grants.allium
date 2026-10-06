@@ -119,12 +119,15 @@ entity ClienteAutorizado {
     estado: pendiente | autorizado | credencial_vencida | revocado | expirado
     creado_en: Timestamp
 
-    -- Vencimiento de la credencial de acceso: corto y renovable.
+    -- El bearer manual dura lo mismo que el piloto y se revoca desde Desktop;
+    -- OAuth usa acceso corto y refresco. La evidencia decide el régimen, no el
+    -- cliente remoto mediante un parámetro de su solicitud.
     expira_en: Timestamp when estado = pendiente | autorizado
     hash_de_credencial: String when estado = autorizado
-    -- Ventana de refresco: larga, y es la que decide cuándo termina de verdad
-    -- el acceso de una aplicación que nadie revocó.
-    hash_de_refresco: String when estado = autorizado | credencial_vencida
+    -- Sólo los flujos renovables reciben secreto de refresco. Un bearer manual
+    -- no puede refrescarse silenciosamente y debe volver a ser autorizado al
+    -- caducar.
+    hash_de_refresco: String? when estado = autorizado | credencial_vencida
     refresco_expira_en: Timestamp when estado = autorizado | credencial_vencida
     revocado_en: Timestamp when estado = revocado
 
@@ -174,6 +177,7 @@ config {
     -- Duraciones del piloto, decididas por el dueño del producto.
     vigencia_de_autorizacion_pendiente: Duration = 10.minutes
     vigencia_de_credencial_de_acceso: Duration = 1.hour
+    vigencia_de_bearer_manual: Duration = 90.days
     ventana_de_refresco: Duration = 90.days
     bits_de_entropia_credencial: Integer = 256
 }
@@ -215,17 +219,17 @@ rule EmitirCredencialDeCliente {
     ensures:
         cliente.estado = autorizado
         cliente.hash_de_credencial = hash(secreto_nuevo(config.bits_de_entropia_credencial))
-        cliente.expira_en = now + config.vigencia_de_credencial_de_acceso
-        cliente.hash_de_refresco = hash(secreto_nuevo(config.bits_de_entropia_credencial))
+        cliente.expira_en = if cliente.concesion.evidencia = bearer_del_piloto: now + config.vigencia_de_bearer_manual else: now + config.vigencia_de_credencial_de_acceso
+        cliente.hash_de_refresco = if cliente.concesion.evidencia = bearer_del_piloto: null else: hash(secreto_nuevo(config.bits_de_entropia_credencial))
         cliente.refresco_expira_en = now + config.ventana_de_refresco
         CredencialDeClienteEmitida(cliente: cliente)
 
     @guidance
-        -- Se entregan dos credenciales de una vez: una de acceso, corta, y una
-        -- de refresco, larga. Ambas se muestran una sola vez y sólo se
-        -- conserva su hash con pepper operacional. El relay no puede
-        -- reconstruirlas ni mostrarlas de nuevo: si se pierden, se autoriza
-        -- otro cliente.
+        -- OAuth entrega acceso corto y refresco largo. El piloto manual
+        -- entrega un único bearer de noventa días porque Claude no conoce el
+        -- endpoint privado de refresco de Conecta. En ambos casos el secreto
+        -- se muestra una vez, se conserva sólo su hash y la persona puede
+        -- revocarlo inmediatamente desde Vera Desktop.
 }
 
 -- Refrescar ---------------------------------------------------------------
@@ -235,6 +239,7 @@ rule CredencialDeAccesoVence {
     -- puede volver a operar presentando la credencial de refresco.
     when: cliente: ClienteAutorizado.expira_en <= now
     requires: cliente.estado = autorizado
+    requires: cliente.concesion.evidencia != bearer_del_piloto
     ensures:
         cliente.estado = credencial_vencida
         cliente.expira_en = null
@@ -244,6 +249,7 @@ rule CredencialDeAccesoVence {
 rule RefrescarCredencialDeCliente {
     when: ClienteRefrescaCredencial(cliente, prueba_de_refresco)
     requires: cliente.estado = credencial_vencida
+    requires: cliente.hash_de_refresco != null
     requires: cliente.refresco_expira_en > now
     requires: verifica(prueba_de_refresco, cliente.hash_de_refresco)
     ensures:
@@ -482,6 +488,11 @@ surface ConsentimientoYClientes {
         -- autenticado del canal de control. En el relay no hay identidad de
         -- persona (ver installation-link.allium): con Desktop apagada no queda
         -- ninguna vía alternativa y la decisión espera a que Desktop vuelva.
+
+    @guarantee ElIdentificadorPublicoNoListaClientes
+        -- Conocer la URL pública ubica la instalación, pero no permite leer
+        -- etiquetas, estados, alcances ni identificadores de sus clientes.
+        -- Listar exige demostrar posesión del secreto de enlace de Desktop.
 
     @guarantee LaEtiquetaEsDeLaPersona
         -- La etiqueta de aplicación la elige la persona y se conserva como

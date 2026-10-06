@@ -2,9 +2,21 @@
 
 ## En una frase
 
-Vera Conecta permite que un cliente MCP remoto llegue, con autorización
-revocable, a una instalación local de Vera mediante una conexión saliente que
-Vera Desktop mantiene hacia un relay administrado por MediaFranca.
+Vera Conecta permite que clientes remotos autorizados —agentes MCP o
+aplicaciones estrechas como Vera Clip— lleguen a una instalación local de Vera
+mediante una conexión saliente que Vera mantiene hacia un relay administrado
+por MediaFranca.
+
+## Experiencia predeterminada
+
+`conecta.mediafranca.net` será un servicio compartido de la comunidad y la
+opción inicial de Vera Desktop. La persona activa Conecta desde Vera, autoriza
+una IA y recibe la información necesaria para ese cliente. No crea una cuenta
+Cloudflare, no administra DNS y no ejecuta instrucciones de terminal.
+
+El autoalojamiento sigue siendo una posibilidad soberana y documentada, no una
+precondición para usar el producto. Una instancia autoalojada conserva el mismo
+contrato de red, permisos y revocación que el servicio compartido.
 
 ## Problema
 
@@ -19,6 +31,7 @@ Vera. Vera Conecta ofrece una puerta pública estable sin publicar toda Vera.
 - ID público opaco de instalación;
 - canal saliente persistente entre Desktop y el relay;
 - endpoint MCP remoto estable por instalación;
+- canal HTTP de captura para Vera Clip, separado del acceso MCP genérico;
 - credenciales separadas por cliente, revocables y con alcances;
 - transporte de solicitudes/respuestas MCP sin persistir su contenido;
 - estado visible: conectada, desconectada, degradada o revocada;
@@ -32,7 +45,8 @@ Vera. Vera Conecta ofrece una puerta pública estable sin publicar toda Vera.
 - publicar la interfaz humana privada de Vera;
 - sincronizar dos instalaciones Vera;
 - editar el grafo por una ruta distinta de las operaciones canónicas de Vera;
-- garantizar compatibilidad con una aplicación que no admita MCP remoto;
+- convertir el relay en una API general para cualquier aplicación;
+- garantizar compatibilidad MCP con una aplicación que no admita MCP remoto;
 - pagos, planes comerciales y administración multi-organización en el MVP.
 
 ## Principios no negociables
@@ -48,6 +62,8 @@ Vera. Vera Conecta ofrece una puerta pública estable sin publicar toda Vera.
    copia servible del grafo.
 7. **El fallo es explícito.** Nunca se confirma una escritura cuyo resultado sea
    incierto.
+8. **El camino simple es el comunitario.** La infraestructura compartida no
+   convierte a MediaFranca en custodio del grafo ni de las claves del proveedor.
 
 ## Éxito del piloto
 

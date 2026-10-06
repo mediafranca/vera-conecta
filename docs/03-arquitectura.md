@@ -1,5 +1,35 @@
 # Arquitectura
 
+## Vista general
+
+```mermaid
+flowchart LR
+    subgraph Nube[Internet]
+      IA[Cliente de IA<br/>ChatGPT, Claude, otro MCP]
+      Relay[Vera Conecta<br/>Worker + Durable Object]
+    end
+    subgraph Equipo[Computador de la persona]
+      Desktop[Vera Desktop]
+      Puerta[Puerta MCP local]
+      Vera[(Biblioteca Vera)]
+    end
+
+    IA -->|HTTPS + OAuth o bearer| Relay
+    Desktop -->|WebSocket saliente persistente| Relay
+    Desktop -->|loopback + credencial local| Puerta
+    Puerta -->|operaciones atribuidas| Vera
+
+    classDef soberano fill:#eaf4e8,stroke:#477a44,color:#183d17
+    classDef transito fill:#fff2df,stroke:#a66b18,color:#4f330d
+    class Desktop,Puerta,Vera soberano
+    class Relay transito
+```
+
+El diagrama muestra la asimetría deliberada: el relay es alcanzable desde
+Internet, pero la biblioteca no. Desktop mantiene el único enlace hacia afuera
+y convierte cada identidad remota en una credencial local de alcance igual o
+menor.
+
 ## Componentes
 
 ### Worker de borde
@@ -26,6 +56,60 @@ backoff, almacena secretos en Keychain/Credential Manager/libsecret, convierte
 sobres del relay en llamadas MCP a `127.0.0.1` y aplica la identidad Vera local.
 Nunca escucha una interfaz pública.
 
+### Autorización sin identidad central
+
+Conecta no recibe la cuenta ni las claves del proveedor de IA. ChatGPT, Claude
+u otro cliente se autentican frente al endpoint MCP de una instalación. En el
+piloto Desktop emite un bearer revocable; en beta el Worker usa OAuth 2.1 y
+Desktop resuelve el consentimiento. La concesión —cliente, instalación y
+alcances— es la misma en ambos casos.
+
+La URL pública es un localizador opaco. Listar clientes, emitir invitaciones o
+revocarlas exige el secreto de enlace que sólo Desktop puede abrir desde el
+almacén seguro del sistema operativo.
+
+El límite entre ambos repositorios queda fijado por este recorrido:
+
+```mermaid
+sequenceDiagram
+    actor D as Dueño de la biblioteca
+    participant UI as VERA: Conexiones
+    participant Desktop as Vera Desktop
+    participant Seguro as Almacén seguro del SO
+    participant Relay as Vera Conecta
+    participant MCP as Puerta MCP local
+    participant G as Grafo soberano
+
+    D->>UI: activa y empareja Vera Conecta
+    UI->>Desktop: solicita emparejamiento
+    Desktop->>Relay: reclama desafío de un solo uso
+    Relay-->>Desktop: id público + secreto de enlace
+    Desktop->>Seguro: cifra y guarda el secreto
+    Desktop->>Relay: abre WebSocket saliente
+    Relay-->>Desktop: solicitud con identidad y alcances
+    Desktop->>MCP: traduce a credencial local revocable
+    MCP->>G: ejecuta bajo la autoridad de VERA
+    G-->>MCP: resultado con procedencia
+    MCP-->>Desktop: respuesta local
+    Desktop-->>Relay: respuesta correlacionada
+    UI-->>D: estado, clientes, alcances y revocación
+
+    Note over Relay,G: El relay no conserva páginas, bloques, prompts ni respuestas
+```
+
+La implementación del ciclo de vida, la custodia del secreto y la traducción a
+credenciales locales vive en `mediafranca/vera`. Este repositorio conserva el
+contrato de red, el Worker, los Durable Objects y sus simuladores. Un cambio en
+los sobres o en el emparejamiento exige actualizar y probar ambos lados antes de
+declarar compatible una versión del protocolo.
+
+Aunque hoy el conector, Vera y Cotito pueden convivir en una misma máquina,
+son responsabilidades separadas. Una instancia Vera puede ejecutarse en un
+equipo personal o en un anfitrión independiente sin cambiar el contrato del
+relay: sólo debe mantener el enlace saliente y exponer localmente las puertas
+canónicas que correspondan. Cotito es un participante de esa instancia, no una
+pieza de Vera Conecta.
+
 ## Rutas previstas
 
 - `GET /health`: salud del despliegue, sin estado de usuarios.
@@ -33,6 +117,9 @@ Nunca escucha una interfaz pública.
 - `POST /pairings/:code/claim`: reclama una sola vez.
 - `GET /v/:installation/link`: upgrade WebSocket autenticado de Desktop.
 - `POST|GET|DELETE /v/:installation/mcp`: Streamable HTTP MCP.
+- `POST /v/:installation/captures`: depósito estrecho de Vera Clip; autentica
+  una credencial con alcance `capture`, transmite el sobre por el mismo enlace
+  y nunca concede lectura del grafo ni operaciones arbitrarias.
 - `/.well-known/oauth-authorization-server`: metadatos OAuth.
 - `/.well-known/oauth-protected-resource`: metadatos del recurso MCP.
 - `/authorize`, `/token`, `/register`: OAuth cuando se habilite.

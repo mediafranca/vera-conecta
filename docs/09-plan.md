@@ -23,7 +23,11 @@ Salida: un eco autenticado extremo a extremo, no MCP productivo.
 
 - Streamable HTTP;
 - bearer piloto, scopes y revocación;
-- conector Desktop contra MCP local;
+- conector Desktop contra MCP local — primer recorrido real de catálogo y
+  `vera_buscar` probado localmente; supervisor de inicio, apagado y reconexión
+  incorporado al ciclo de vida efectivo de la app;
+- interfaz Desktop para autorizar, copiar, listar y revocar clientes remotos;
+- bearer manual durable y revocable para clientes sin refresco automático;
 - errores offline, timeout, límites y streaming;
 - MCP Inspector + Hermes.
 
@@ -40,7 +44,10 @@ Salida: escritura atribuida, revocable e idempotente.
 
 ## M4 — OAuth y beta externa
 
-- OAuth 2.1, consentimiento, expiración y refresh;
+- OAuth 2.1 mediante `@cloudflare/workers-oauth-provider`, con PKCE,
+  descubrimiento MCP, audiencia por instalación, expiración y refresh;
+- consentimiento solicitado por navegador y resuelto en Vera Desktop, sin
+  cuenta MediaFranca;
 - interfaz “Conectar una IA”;
 - Workers Paid, dominio y observabilidad filtrada;
 - auditoría de seguridad, privacidad y aislamiento;
