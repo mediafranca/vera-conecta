@@ -39,7 +39,7 @@ propio enlace saliente.
 
 ```sh
 cd ~/Sites/vera-conecta
-npm install
+npm ci
 npx wrangler login
 npx wrangler whoami
 npm run check
@@ -48,12 +48,29 @@ npm run deploy:staging
 
 Después:
 
-1. comprobar `/health` en `vera-conecta-staging.<subdominio>.workers.dev`;
+1. comprobar `/health` en
+   `https://vera-conecta-staging.mediafranca.workers.dev`;
 2. emparejar una Vera sin datos reales;
 3. probar dos instalaciones y verificar que no pueden cruzarse;
 4. crear dos clientes, revocar uno y comprobar que el otro sigue activo;
 5. cortar Desktop durante una lectura y una escritura;
 6. revisar que logs, errores y métricas no contienen payloads ni credenciales.
+
+### Staging vigente
+
+Creado el 6 de octubre de 2026 en la cuenta Cloudflare que contiene
+`mediafranca.net`:
+
+- Worker: `vera-conecta-staging`;
+- URL: `https://vera-conecta-staging.mediafranca.workers.dev`;
+- binding: `INSTALLATIONS → InstallationRelay`;
+- almacenamiento: Durable Objects SQLite;
+- observabilidad y preview URLs: desactivadas;
+- secreto: `VERA_CONECTA_TOKEN_PEPPER`, oculto y exclusivo de staging.
+
+La verificación inicial usó dos Vera efímeras sin datos personales y comprobó
+lectura MCP real, aislamiento, revocación selectiva, error `vera_offline` y
+reconexión. No implica que producción esté disponible.
 
 ## Producción compartida
 

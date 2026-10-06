@@ -46,11 +46,14 @@ sólo conoce el origen público del relay y abre hacia él una conexión salient
 
 ```sh
 npm run deploy:staging
-curl https://vera-conecta-staging.<subdominio>.workers.dev/health
+curl https://vera-conecta-staging.mediafranca.workers.dev/health
 ```
 
 Staging permanece en `workers.dev` para no crear un nombre que después parezca
-producción. No recibe datos personales reales.
+producción. No recibe datos personales reales. El origen de staging quedó
+creado el 6 de octubre de 2026; usa el Durable Object `InstallationRelay`, el
+binding `INSTALLATIONS` y un pepper propio, distinto del futuro secreto de
+producción.
 
 ## Producción
 

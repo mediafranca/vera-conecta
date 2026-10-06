@@ -51,8 +51,9 @@ desconectar los demás.
 
 ## Estado comprobado
 
-El relay y la interfaz de Vera Desktop están **probados localmente**, pero aún
-no hay un ambiente público desplegado.
+El relay tiene un **staging público operativo** en
+`https://vera-conecta-staging.mediafranca.workers.dev`. Producción todavía no
+está desplegada y `conecta.mediafranca.net` no debe anunciarse como disponible.
 
 - emparejamiento de una instalación y WebSocket saliente hibernable;
 - endpoint MCP remoto por instalación;
@@ -63,9 +64,15 @@ no hay un ambiente público desplegado.
 - canal estrecho para Vera Clip, separado del acceso MCP general;
 - 57 pruebas del relay y el empaquetado completo de Vera Desktop verificados.
 
-Todavía faltan el despliegue en Cloudflare, una prueba externa contra
-`conecta.mediafranca.net`, OAuth 2.1, streaming HTTP completo y las puertas de
-seguridad de la beta.
+El 6 de octubre de 2026 se probó staging con dos instalaciones Vera efímeras:
+emparejamiento, WebSocket saliente, lectura MCP real, aislamiento, revocación,
+desconexión y reconexión. La prueba descubrió y corrigió en Vera la integración
+de la puerta MCP local; esa corrección debe publicarse junto con una versión de
+Desktop antes del piloto.
+
+Todavía faltan la integración protegida de ambos repositorios, el despliegue y
+la prueba externa contra `conecta.mediafranca.net`, OAuth 2.1, streaming HTTP
+completo y las puertas de seguridad de la beta.
 
 ### Compatibilidad prevista
 
