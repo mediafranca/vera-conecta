@@ -5,7 +5,7 @@ describe("borde del relay", () => {
   it("/health responde sin exponer estado de instalaciones", async () => {
     const response = await SELF.fetch("https://vera-conecta.test/health");
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ service: "vera-conecta" });
+    expect(await response.json()).toEqual({ service: "vera-conecta", status: "ok", protocol: 1 });
   });
 
   it("cierra las rutas de producto que aún no están probadas extremo a extremo", async () => {

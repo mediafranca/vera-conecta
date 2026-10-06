@@ -15,11 +15,11 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(200, { service: "vera-conecta", status: "design-skeleton" });
+      return json(200, { service: "vera-conecta", status: "ok", protocol: 1 });
     }
 
     if (request.method === "GET" && url.pathname === "/") {
-      return landingResponse();
+      return landingResponse(url.hostname);
     }
 
     if (request.method === "POST" && url.pathname === "/pairings") {
